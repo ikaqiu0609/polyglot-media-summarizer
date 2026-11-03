@@ -10,9 +10,10 @@ $: # 兜底分支
   vscode:
     - name: gpu-dev
       # ---------------- GPU 资源声明 ----------------
-      runner:
+      # runner:
         # cnb:arch:amd64:gpu 或 cnb:arch:amd64:gpu:L40（均为 amd64 / 16 核 / 48GB 显存）
-        tags: cnb:arch:amd64:gpu
+        # 日后发迹了记得打开。。。
+        # tags: cnb:arch:amd64:gpu
       # ---------------- 开发环境镜像 ----------------
       docker:
         # 用仓库根目录的 Dockerfile 构建（内含 CUDA + torch2.9 + ffmpeg + murmurai-core）
