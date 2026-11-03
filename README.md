@@ -297,7 +297,7 @@ docker run --rm --gpus all nvidia/cuda:12.8.0-base-ubuntu24.04 nvidia-smi
 | 显卡 | NVIDIA，显存 ≥ 6GB（RTX 4070 8G 够用） | `nvidia-smi` |
 | 驱动 | 支持 CUDA 12.8（`nvidia-smi` 右上角 `CUDA Version` ≥ 12.8） | 低于 12.8 先去官网升级驱动 |
 | 磁盘 | ≥ 15GB 空闲（torch 约 3GB + 模型 3~6GB + 数据） | 资源管理器 |
-| 软件 | Git、Python 3.12、FFmpeg | 见 B1~B3 |
+| 软件 | Git、Python（3.10~3.13，**不要 3.14**）、FFmpeg | 见 B1~B3 |
 
 > 全程用 **PowerShell**（不是 cmd）：按 `Win` 键 → 输入 `powershell` → 回车。
 > 装完任何软件都要**关掉再重开** PowerShell，否则 PATH 不生效。
@@ -312,17 +312,31 @@ git --version
 - 成功标志：`git version 2.x.x`
 - 没有 `winget`：去 <https://git-scm.com/download/win> 下载安装包，一路 Next 即可。
 
-### B2. 安装 Python 3.12
+### B2. 准备 Python（3.10 ~ 3.13）
+
+先看机器上已经有什么，**有 3.10~3.13 就不用再装**：
+
+```powershell
+py -0p
+```
+
+```
+ -V:3.14 *        C:\Users\you\AppData\Local\Programs\Python\Python314\python.exe
+ -V:3.13          C:\Users\you\AppData\Local\Programs\Python\Python313\python.exe
+```
+
+- `*` 表示 `py` 的**默认**版本。上面这种情况默认是 3.14，**不能用来建虚拟环境**，后面必须显式写 `py -3.13`。
+- 只有 3.14 或没有可用版本时：
 
 ```powershell
 winget install --id Python.Python.3.12 -e --source winget
-py -3.12 --version
+py -0p                      # 重新确认，装完可能需要新开终端
 ```
 
-- 成功标志：`Python 3.12.x`
-- 用官网安装包时，**第一页必须勾选 `Add python.exe to PATH`**，否则后面所有 `python` 命令都找不到。
+- 成功标志：`py -0p` 里出现 `-V:3.12` 或 `-V:3.13`。
+- 用官网安装包时，**第一页必须勾选 `Add python.exe to PATH`**。
 - 不要装 Microsoft Store 版（路径特殊，虚拟环境容易出问题）。
-- 版本范围是 `3.10 ~ 3.13`，**不要用 3.14**（`murmurai-core` 不支持）。
+- **3.14 不行**：`murmurai-core` 要求 `Python < 3.14`，用 3.14 建的环境装依赖会直接报 `requires Python <3.14`。
 
 ### B3. 安装 FFmpeg
 
@@ -352,10 +366,19 @@ dir
 ### B5. 创建虚拟环境并安装依赖
 
 ```powershell
-py -3.12 -m venv .venv
+py -3.13 -m venv .venv        # 3.13 换成 B2 里 py -0p 看到的版本（3.10~3.13）
 .\.venv\Scripts\Activate.ps1
+python -V                     # 必须显示所选版本，且提示符前出现 (.venv)
+
 python -m pip install --upgrade pip
+
+# ① 先装 CUDA 版 torch
+pip install torch==2.9.0 torchaudio==2.9.0 --index-url https://download.pytorch.org/whl/cu128
+python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available())"
+
+# ② 再装项目依赖
 pip install -r requirements.txt
+pip check
 ```
 
 激活时报「禁止运行脚本」就执行：
@@ -365,17 +388,16 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 .\.venv\Scripts\Activate.ps1
 ```
 
-激活成功的标志：命令行前面出现 `(.venv)`。
+**为什么 torch 必须放在 requirements 前面？**
 
-接着装 **CUDA 版 torch** —— `requirements.txt` 里刻意没写它（云端靠镜像提供），本地必须自己装：
+- `pip install -r requirements.txt` 会因为 `murmurai-core` 的 `torch>=2.9.0` **间接**装一个 PyPI 默认版 torch（Windows 上那是 CPU 版）；
+- 先装 cu128 版，第 ② 步会认为「已满足」，既不重复下载、也不会把 CUDA 版覆盖回 CPU 版；
+- 顺序反了（先 ② 后 ①）就会「先装新版、再降级覆盖」，留下 torchvision / torchcodec 与新 torch 不配套，`pip` 报 `torchvision ... requires torch>=x.y`，`pip check` 也会变红。
 
-```powershell
-pip install torch==2.9.0 torchaudio==2.9.0 --index-url https://download.pytorch.org/whl/cu128
-python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
-```
-
-- 成功标志：`2.9.0+cu128 True`
-- 若是 `2.9.0+cpu False`：装成 CPU 版了，重跑上面那条（别用默认源）。
+- 成功标志：`2.9.0+cu128 12.8 True`
+- 若是 `2.9.0+cpu None False`：装成 CPU 版了，重跑 ① 那条（别用默认源）。
+- 若提示 `torchvision ... requires torch>=2.14.0`：**本项目不使用 torchvision**，执行 `pip uninstall -y torchvision` 即可，不影响任何功能。
+- 若提示 `UnicodeDecodeError: 'gbk' codec can't decode byte ...`：`requirements.txt` 被保存成了「中文注释 + 无 BOM」，pip 24.x 会按 GBK 解码。仓库里的版本已改为纯 ASCII，不会出现；若你自己加过中文注释，改用 `$env:PYTHONUTF8="1"` 再装，或把文件另存为「UTF-8 with BOM」。
 
 ### B6. 让 ctranslate2 找到 cuDNN 9
 
@@ -484,6 +506,9 @@ python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
 |---|---|---|
 | `无法加载文件 Activate.ps1，因为在此系统上禁止运行脚本` | PowerShell 执行策略限制 | `Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass` |
 | `python` / `py` 不是内部或外部命令 | 没勾 Add to PATH，或没重开终端 | 重装 Python 并勾选 PATH，或重开 PowerShell |
+| `No suitable Python runtime found`（`py -3.12` 时） | 机器上没装 3.12；`py` 只挑已装版本，不会自动下载 | `py -0p` 看实际版本，然后用 `py -3.13 -m venv .venv`；确实没有 3.10~3.13 再 `winget install --id Python.Python.3.12 -e` |
+| `pip` 报 `UnicodeDecodeError: 'gbk' codec can't decode byte ...` | pip 24.x 在中文 Windows 上按 cp936 解 `requirements.txt`，文件却是无 BOM 的 UTF-8 | 临时：`$env:PYTHONUTF8="1"` 后重试；永久：文件存成纯 ASCII 或 UTF-8 with BOM（仓库版本已修正） |
+| `pip` 报 `torchvision ... requires torch>=x.y` | 旧环境遗留的 torchvision 与被降级/换版的 torch 不配套 | 本项目不用它：`pip uninstall -y torchvision`，再 `pip check` |
 | `torch.cuda.is_available()` 是 False | 装成了 CPU 版 | 按 B5 重装 cu128 版 |
 | `ct2 cuda devices: 0` | 缺 cuDNN 9 DLL | 按 B6 处理 |
 | 转录极慢、任务管理器里 GPU 占用接近 0 | 同上，已静默退回 CPU | 同上 |
@@ -500,7 +525,7 @@ python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
 | 脚本 | 作用 | 用法 |
 |---|---|---|
 | `scripts\check-env.ps1` | 8 项自检：Python 版本 / 依赖 / torch-CUDA / cuDNN / FFmpeg / 密钥 / 数据目录 / 显存与模型档位是否匹配 | `powershell -ExecutionPolicy Bypass -File .\scripts\check-env.ps1` |
-| `scripts\start-local.ps1` | 定位 `.venv` → 检查端口 → 启动 uvicorn → 自动打开 `/docs` | `.\scripts\start-local.ps1` |
+| `scripts\start-local.ps1` | 定位虚拟环境（自动识别 `.venv` / `venv`）→ 检查端口 → 启动 uvicorn → 自动打开 `/docs` | `.\scripts\start-local.ps1` |
 
 常用参数：
 
@@ -508,7 +533,7 @@ python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
 .\scripts\start-local.ps1 -Port 8001              # 换端口
 .\scripts\start-local.ps1 -Reload                 # 开发模式，改代码自动重载
 .\scripts\start-local.ps1 -NoBrowser              # 不自动开浏览器
-.\scripts\start-local.ps1 -Setup                  # 首次使用：自动建 .venv 并装依赖（会下载数 GB）
+.\scripts\start-local.ps1 -Setup                  # 首次使用：自动挑 3.10~3.13 建 .venv、装 torch + 依赖（会下载数 GB）
 .\scripts\start-local.ps1 -BindAddress 0.0.0.0    # 局域网访问（本项目无鉴权，谨慎）
 ```
 

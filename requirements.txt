@@ -1,29 +1,38 @@
 # ---------------------------------------------------------------------------
-# torch / torchaudio 刻意不写在这里：
-#   - Docker / cnb.cool：由基础镜像 pytorch/pytorch:2.9.0-cuda12.8-cudnn9-runtime 提供，
-#     写进来会让 pip 拉一个 CPU 版覆盖掉 CUDA 版；
-#   - Windows 本地：需要手动装 CUDA 版（版本要和 murmurai-core 的 >=2.9.0 对齐），例如：
+# Python 3.10 ~ 3.13 only. 3.14 is NOT supported by murmurai-core (requires <3.14).
+#
+# torch / torchaudio are intentionally NOT listed here:
+#   - Docker / cnb.cool : provided by the base image
+#                         pytorch/pytorch:2.9.0-cuda12.8-cudnn9-runtime
+#   - Windows / macOS   : install the CUDA build manually and BEFORE this file,
+#                         otherwise pip resolves the latest (CPU-only) build first
+#                         and then downgrades it, breaking torchvision/torchcodec:
 #       pip install torch==2.9.0 torchaudio==2.9.0 --index-url https://download.pytorch.org/whl/cu128
-#     faster-whisper(ctranslate2) 还需要 CUDA 12 + cuDNN 9 的 DLL，最省事的方式是：
-#       pip install nvidia-cudnn-cu12==9.*  （然后把 site-packages\nvidia\cudnn\bin 加入 PATH）
+#   - If pip warns "torchvision ... requires torch>=x.y": this project never imports
+#     torchvision, so just run:  pip uninstall -y torchvision
+#   - faster-whisper (ctranslate2) also needs CUDA 12 + cuDNN 9 DLLs on Windows:
+#       pip install nvidia-cudnn-cu12==9.*   (then add site-packages\nvidia\cudnn\bin to PATH)
+#
+# KEEP THIS FILE ASCII-ONLY: pip <= 24.x decodes requirements files with the system
+# locale (cp936 on Chinese Windows) unless the file starts with a UTF-8 BOM.
 # ---------------------------------------------------------------------------
 
-# ASR + 说话人分离（WhisperX 的 fork，API 兼容：import murmurai 即可替代 import whisperx）
+# ASR + speaker diarization (WhisperX fork; `import murmurai` is a drop-in for `import whisperx`)
 murmurai-core==1.0.6
 
-# pyannote 由 murmurai-core 带入，这里显式约束大版本，避免将来 5.x 破坏 API
+# pyannote comes with murmurai-core; pin the major version to avoid breaking changes in 5.x
 pyannote.audio>=4.0,<5
 
-# 大模型总结
+# LLM summarization (DeepSeek, OpenAI-compatible API)
 openai>=1.55.0
 
-# 后端
+# Web backend
 fastapi>=0.115.0
 uvicorn[standard]>=0.32.0
 python-multipart>=0.0.9
 pydantic>=2.9.0
 pydantic-settings>=2.6.0
 
-# 本地开发：从项目根目录的 .env 读取环境变量（app/config.py 调用 load_dotenv）
-# 云端由平台直接注入系统环境变量，不装也能跑（代码里是 try/except 保护）
+# Loads .env from the project root (app/config.py). Optional in the cloud,
+# where the platform injects real environment variables.
 python-dotenv>=1.0.1

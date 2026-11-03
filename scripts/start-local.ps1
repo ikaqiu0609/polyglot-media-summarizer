@@ -57,33 +57,76 @@ Write-Host "项目目录: $ProjectRoot"
 # ---------------------------------------------------------------------------
 # 1. 定位 / 准备 Python 虚拟环境
 # ---------------------------------------------------------------------------
-$python = Join-Path $ProjectRoot ".venv\Scripts\python.exe"
+function Find-VenvPython {
+    # 兼容 .venv / venv / env 三种目录名
+    param([string]$Root)
+    foreach ($name in @(".venv", "venv", "env")) {
+        $candidate = Join-Path $Root "$name\Scripts\python.exe"
+        if (Test-Path $candidate) { return $candidate }
+    }
+    return $null
+}
+
+function Find-CompatiblePythonArg {
+    # murmurai-core 支持 3.10 ~ 3.13。py 启动器默认可能指向 3.14（装不上依赖），
+    # 所以这里从高到低显式挑一个兼容版本。
+    foreach ($v in @("3.13", "3.12", "3.11", "3.10")) {
+        $arg = "-$v"
+        & py $arg -c "import sys" 2>$null | Out-Null
+        if ($LASTEXITCODE -eq 0) { return $arg }
+    }
+    return $null
+}
+
+$python = Find-VenvPython -Root $ProjectRoot
+if (-not $python) { $python = Join-Path $ProjectRoot ".venv\Scripts\python.exe" }
 
 if (-not (Test-Path $python)) {
     if (-not $Setup) {
-        Write-Host "[FAIL] 未找到虚拟环境：$python" -ForegroundColor Red
+        Write-Host "[FAIL] 未找到虚拟环境（已查找 .venv / venv）" -ForegroundColor Red
         Write-Host "       请先按 README B5 执行：" -ForegroundColor DarkGray
-        Write-Host "         py -3.12 -m venv .venv" -ForegroundColor DarkGray
+        Write-Host "         py -0p                        :: 看装了哪些 Python（要 3.10~3.13）" -ForegroundColor DarkGray
+        Write-Host "         py -3.13 -m venv .venv        :: 把 3.13 换成你实际有的版本" -ForegroundColor DarkGray
         Write-Host "         .\.venv\Scripts\Activate.ps1" -ForegroundColor DarkGray
-        Write-Host "         pip install -r requirements.txt" -ForegroundColor DarkGray
         Write-Host "         pip install torch==2.9.0 torchaudio==2.9.0 --index-url https://download.pytorch.org/whl/cu128" -ForegroundColor DarkGray
+        Write-Host "         pip install -r requirements.txt" -ForegroundColor DarkGray
         Write-Host "       或让本脚本自动准备（会下载数 GB）：.\scripts\start-local.ps1 -Setup" -ForegroundColor DarkGray
         exit 1
     }
 
     Write-Host "[..] -Setup：创建虚拟环境并安装依赖（耗时较长，请耐心等）" -ForegroundColor Cyan
+    $venvDir = Join-Path $ProjectRoot ".venv"
     if (Get-Command py -ErrorAction SilentlyContinue) {
-        & py -3.12 -m venv .venv
+        $verArg = Find-CompatiblePythonArg
+        if (-not $verArg) {
+            Write-Host "[FAIL] 没找到 3.10~3.13 的 Python（3.14 不被 murmurai-core 支持）" -ForegroundColor Red
+            Write-Host "       安装 3.12：winget install --id Python.Python.3.12 -e" -ForegroundColor DarkGray
+            exit 1
+        }
+        Write-Host "       使用 Python $verArg 创建虚拟环境" -ForegroundColor DarkGray
+        & py $verArg -m venv $venvDir
     } else {
-        & python -m venv .venv
+        & python -m venv $venvDir
     }
+
+    $python = Join-Path $venvDir "Scripts\python.exe"
     if (-not (Test-Path $python)) {
-        Write-Host "[FAIL] 虚拟环境创建失败，请先装 Python 3.12（README B2）" -ForegroundColor Red
+        Write-Host "[FAIL] 虚拟环境创建失败，请先装 Python 3.12/3.13（README B2）" -ForegroundColor Red
         exit 1
     }
+    $pyVer = & $python -c "import sys; print('%d.%d' % sys.version_info[:2])"
+    Write-Host "       venv Python: $pyVer" -ForegroundColor DarkGray
+    if ([version]$pyVer -ge [version]"3.14") {
+        Write-Host "[FAIL] 虚拟环境是 Python $pyVer，murmurai-core 要求 < 3.14" -ForegroundColor Red
+        Write-Host "       删掉重建：rmdir /s /q .venv  然后 py -3.13 -m venv .venv" -ForegroundColor DarkGray
+        exit 1
+    }
+
     & $python -m pip install --upgrade pip
-    & $python -m pip install -r requirements.txt
+    # 顺序很重要：先 CUDA 版 torch，再 requirements；反过来 pip 会先解析出 CPU 版 torch
     & $python -m pip install torch==2.9.0 torchaudio==2.9.0 --index-url https://download.pytorch.org/whl/cu128
+    & $python -m pip install -r requirements.txt
+    & $python -m pip check
     Write-Host "[OK] 依赖安装完成；建议先跑一次 .\scripts\check-env.ps1" -ForegroundColor Green
 }
 

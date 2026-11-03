@@ -51,7 +51,17 @@ Write-Host "项目目录: $ProjectRoot"
 # ---------------------------------------------------------------------------
 Step "1/8 Python 解释器"
 
-$venvPython = Join-Path $ProjectRoot ".venv\Scripts\python.exe"
+function Find-VenvPython {
+    # 兼容 .venv / venv / env 三种目录名（不同教程创建的虚拟环境名字不一样）
+    param([string]$Root)
+    foreach ($name in @(".venv", "venv", "env")) {
+        $candidate = Join-Path $Root "$name\Scripts\python.exe"
+        if (Test-Path $candidate) { return $candidate }
+    }
+    return $null
+}
+
+$venvPython = Find-VenvPython -Root $ProjectRoot
 $usingVenv = $false
 
 if ($Python -and -not (Test-Path $Python)) {
@@ -59,7 +69,7 @@ if ($Python -and -not (Test-Path $Python)) {
     if ($resolved) { $Python = $resolved.Source }
 }
 if (-not $Python) {
-    if (Test-Path $venvPython) {
+    if ($venvPython) {
         $Python = $venvPython
         $usingVenv = $true
     } else {
@@ -69,15 +79,15 @@ if (-not $Python) {
 }
 if (-not $Python -or -not (Test-Path $Python)) {
     Fail "找不到 Python"
-    Hint "先完成 README B2：winget install --id Python.Python.3.12 -e"
-    Hint "然后 B5：py -3.12 -m venv .venv"
+    Hint "先看装了哪些版本：py -0p（需要 3.10 ~ 3.13）"
+    Hint "然后建虚拟环境：py -3.13 -m venv .venv（把 3.13 换成你实际有的版本）"
     exit 1
 }
 if ($usingVenv) {
     Ok "使用虚拟环境: $Python"
 } else {
-    Warn "未找到 .venv，使用系统 Python: $Python"
-    Hint "建议先执行 B5：py -3.12 -m venv .venv 并安装依赖"
+    Warn "未找到 .venv / venv，使用系统 Python: $Python"
+    Hint "建议先执行 B5：py -0p 看版本，再 py -3.13 -m venv .venv 并安装依赖"
 }
 
 # ---------------------------------------------------------------------------
@@ -104,12 +114,22 @@ except Exception as exc:
 try:
     import torch
     out["torch"] = torch.__version__
+    out["torch_cuda"] = torch.version.cuda or ""
     out["cuda"] = bool(torch.cuda.is_available())
     if out["cuda"]:
         out["cuda_name"] = torch.cuda.get_device_name(0)
         out["vram_gb"] = round(torch.cuda.get_device_properties(0).total_memory / (1024 ** 3), 1)
 except Exception as exc:
     out["torch_error"] = "{}: {}".format(type(exc).__name__, exc)
+
+try:
+    import torchvision
+    out["torchvision"] = torchvision.__version__
+except ImportError:
+    pass  # 本项目不用 torchvision，没装是正常状态
+except Exception as exc:
+    # 装过但和当前 torch 不配套（ABI 不匹配），导入时就会炸
+    out["torchvision_error"] = "{}: {}".format(type(exc).__name__, exc)
 
 try:
     import ctranslate2
@@ -172,7 +192,12 @@ if ($ver -and $ver -ge [version]"3.10" -and $ver -lt [version]"3.14") {
     Ok "Python $($info.python)"
 } else {
     Fail "Python $($info.python) 不在 3.10 ~ 3.13 范围内"
-    Hint "murmurai-core 要求 < 3.14；请安装 Python 3.12 并重建 .venv"
+    if ($ver -and $ver -ge [version]"3.14") {
+        Hint "murmurai-core 要求 < 3.14，3.14 装不上依赖"
+        Hint "用已有版本重建：py -3.13 -m venv .venv（先 py -0p 看装了哪些）"
+    } else {
+        Hint "版本太旧，请安装 Python 3.12/3.13：winget install --id Python.Python.3.12 -e"
+    }
 }
 
 # ---------------------------------------------------------------------------
@@ -185,6 +210,21 @@ if ($info.deps_error) {
 } else {
     Ok "fastapi / openai / murmurai 均可导入"
 }
+if ($info.torchvision_error) {
+    Warn "torchvision 与当前 torch 不配套：$($info.torchvision_error)"
+    Hint "本项目不使用 torchvision，直接卸载：pip uninstall -y torchvision"
+} elseif ($info.torchvision) {
+    Warn "检测到 torchvision $($info.torchvision)（本项目用不到，不影响使用）"
+    Hint "若下面 pip check 报它和 torch 冲突，执行：pip uninstall -y torchvision"
+}
+$pipCheckOut = & $Python -m pip check 2>&1
+if ($LASTEXITCODE -eq 0) {
+    Ok "pip check：无依赖冲突"
+} else {
+    Warn "pip 报告依赖冲突："
+    foreach ($line in ($pipCheckOut | Select-Object -First 4)) { Hint "$line" }
+    Hint "只涉及 torchvision / torchcodec 时，卸载或重装对应包即可（见 README B11）"
+}
 
 # ---------------------------------------------------------------------------
 # 5. torch 与 CUDA
@@ -194,7 +234,7 @@ if ($info.torch_error) {
     Fail "torch 不可用：$($info.torch_error)"
     Hint "pip install torch==2.9.0 torchaudio==2.9.0 --index-url https://download.pytorch.org/whl/cu128"
 } elseif ($info.cuda) {
-    Ok "torch $($info.torch) · CUDA 可用 · $($info.cuda_name) · $($info.vram_gb)GB 显存"
+    Ok "torch $($info.torch) · CUDA $($info.torch_cuda) · $($info.cuda_name) · $($info.vram_gb)GB 显存"
 } else {
     Fail "torch $($info.torch) 已安装，但 CUDA 不可用（多半装成了 CPU 版）"
     Hint "pip uninstall -y torch torchaudio 后重装 cu128 版；并确认 nvidia-smi 的 CUDA Version >= 12.8"
