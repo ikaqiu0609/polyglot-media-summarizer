@@ -297,12 +297,24 @@ def run_pipeline(task_id: str) -> None:
 
 def _fail(task_id: str, message: str) -> None:
     logger.error("任务 %s 失败：%s", task_id, message)
+    # 转录已完成、只在总结阶段失败时，把产物路径回传，方便单独重跑总结而不用重新上传
+    result = None
+    transcript = settings.transcript_path(task_id)
+    if transcript.exists():
+        result = {
+            "transcript_path": str(transcript),
+            "hint": (
+                "转录已完成，可单独重跑总结："
+                f"python -m app.services.summarizer {transcript} --out {settings.summary_path(task_id)}"
+            ),
+        }
     _update(
         task_id,
         status=TaskStatus.FAILED,
         detail="处理失败",
         error=message[:2000],
         finished_at=datetime.now(timezone.utc),
+        result=result,
     )
 
 

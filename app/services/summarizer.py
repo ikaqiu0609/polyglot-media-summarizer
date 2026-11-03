@@ -226,6 +226,24 @@ def _build_params(messages: list[dict], *, model: str, max_tokens: int, json_mod
     return params
 
 
+def _explain_api_error(exc: Exception) -> str:
+    """把 OpenAI/DeepSeek 的 HTTP 错误翻译成可操作的中文提示。"""
+    status = getattr(exc, "status_code", None) or getattr(exc, "code", None)
+    if isinstance(status, int):
+        if status == 401:
+            return "API Key 无效或已失效，请检查 .env 里的 DEEPSEEK_API_KEY"
+        if status == 402:
+            return (
+                "DeepSeek 账户余额不足，请先充值 https://platform.deepseek.com/top_up 后重试"
+                "（转录结果已保存，无需重新转录）"
+            )
+        if status == 429:
+            return "请求过于频繁（429），请稍后重试或调小并发"
+        if status >= 500:
+            return f"DeepSeek 服务端错误（{status}），请稍后重试"
+    return str(exc)
+
+
 def _retryable(exc: Exception) -> bool:
     try:
         from openai import APIConnectionError, APITimeoutError, InternalServerError, RateLimitError  # noqa: PLC0415
@@ -281,7 +299,7 @@ def _chat(
             logger.warning("[%s] 第 %d 次调用失败：%s，%ds 后重试", purpose or "chat", attempt, exc, backoff)
             time.sleep(backoff)
 
-    raise SummarizationError(f"DeepSeek 调用失败（{purpose}）: {last_exc}") from last_exc
+    raise SummarizationError(f"DeepSeek 调用失败（{purpose}）：{_explain_api_error(last_exc)}") from last_exc
 
 
 def _strip_code_fence(text: str) -> str:
