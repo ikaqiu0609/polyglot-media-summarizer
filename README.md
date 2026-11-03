@@ -280,6 +280,8 @@ curl -s http://127.0.0.1:8000/healthz
 ```
 
 > 镜像里**不** COPY 业务代码（CNB 云原生开发的构建上下文只包含 `.cnb.yml` 里 `build.by` 声明的文件），所以要用 `-v "$PWD:/workspace"` 把仓库挂进容器，否则 `uvicorn app.main:app` 找不到 `app/`。
+>
+> Dockerfile 用了 BuildKit 的 cache mount 来复用 apt / pip 的下载缓存，所以需要 **Docker 23+**（默认启用 BuildKit），或显式 `DOCKER_BUILDKIT=1 docker build -t pms:dev .`。若你的 Docker 更老、报 `unknown flag: mount`，把 `RUN --mount=...` 那两行参数删掉即可照旧构建，只是失去缓存加速。
 
 前置条件：宿主机装好 NVIDIA 驱动与 [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html)，并确认下面这条能打印出显卡信息：
 
