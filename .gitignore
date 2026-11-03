@@ -1,0 +1,28 @@
+# 模型缓存 / 中间产物 / 上传文件，均不入库
+.cache/
+data/
+models/
+*.wav
+*.mp3
+*.mp4
+*.mkv
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# 密钥
+.env
+*.env
+!*.env.example
+
+# 编辑器 / 环境回收站
+.idea/
+.vscode/
+.DS_Store
+.Trash-*/

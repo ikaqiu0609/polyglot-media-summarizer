@@ -1,0 +1,23 @@
+# ---------------------------------------------------------------------------
+# 注意：torch / torchaudio 由基础镜像 pytorch/pytorch:2.9.0-cuda12.8-cudnn9-runtime 提供，
+# 这里刻意不写，避免 pip 拉一个 CPU 版 torch 覆盖掉 CUDA 版。
+# ---------------------------------------------------------------------------
+
+# ASR + 说话人分离（WhisperX 的 fork，API 兼容：import murmurai 即可替代 import whisperx）
+murmurai-core==1.0.6
+
+# pyannote 由 murmurai-core 带入，这里显式约束大版本，避免将来 5.x 破坏 API
+pyannote.audio>=4.0,<5
+
+# 大模型总结
+openai>=1.55.0
+
+# 后端
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+python-multipart>=0.0.9
+pydantic>=2.9.0
+pydantic-settings>=2.6.0
+
+# 本地开发便利（读取 .env；云端直接注入环境变量时可不装）
+python-dotenv>=1.0.1

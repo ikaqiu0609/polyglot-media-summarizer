@@ -1,0 +1,64 @@
+# 云原生开发环境配置（.cnb.yml）
+# 说明：
+#   1. `vscode` 事件（云原生开发）与分支无关，必须写在 `$` 兜底分支下；
+#   2. GPU 通过 runner.tags 选择节点：cnb:arch:amd64:gpu（固定 16 核 / 48GB 显存 / 最长 18h）；
+#      GPU 节点 CPU 核数是固定的，写 runner.cpus 无意义，故不配置；
+#   3. 密钥（HF_TOKEN / DEEPSEEK_API_KEY）**不写进本文件**，走「个人环境变量」或密钥仓库 imports 注入，
+#      见文件末尾注释。
+$: # 兜底分支
+  vscode:
+    - name: gpu-dev
+      # ---------------- GPU 资源声明 ----------------
+      runner:
+        # cnb:arch:amd64:gpu 或 cnb:arch:amd64:gpu:L40（均为 amd64 / 16 核 / 48GB 显存）
+        tags: cnb:arch:amd64:gpu
+      # ---------------- 开发环境镜像 ----------------
+      docker:
+        # 用仓库根目录的 Dockerfile 构建（内含 CUDA + torch2.9 + ffmpeg + murmurai-core）
+        build: Dockerfile
+      services:
+        - vscode # 网页版 IDE
+        - docker # 需要 docker build / dind 时保留
+      # ---------------- 环境变量（非敏感） ----------------
+      env:
+        HF_HOME: /workspace/.cache/huggingface
+        TORCH_HOME: /workspace/.cache/torch
+        PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+        ASR_MODEL: large-v3
+        ASR_COMPUTE_TYPE: float16
+        ASR_BATCH_SIZE: "16"
+        # 单文件最长切片时长（分钟），超过则切分，防止 OOM
+        CHUNK_MINUTES: "15"
+      options:
+        # 开发环境保活时间：2 小时无 IDE/SSH 心跳才回收，默认仅 10 分钟
+        keepAliveTimeout: 2h
+      # ---------------- 启动后的自检任务 ----------------
+      stages:
+        - name: 环境自检
+          # 自检失败不影响开发环境使用
+          allowFailure: true
+          script:
+            - nvidia-smi || echo "未检测到 GPU，请确认仓库/组织是否开通 GPU 节点"
+            - ffmpeg -version | head -n 1
+            - python -c "import torch, murmurai; print('torch', torch.__version__, '| cuda', torch.cuda.is_available(), '| murmurai', getattr(murmurai, '__version__', 'ok'))"
+
+# ---------------------------------------------------------------------------
+# 密钥注入方式（二选一，切勿把 Token 明文提交到仓库）
+#
+# 方式 A（推荐，跨仓库复用）：个人设置 > 云原生开发 > 个人环境变量
+#   - imports: https://cnb.cool/<你的密钥仓库>/-/blob/main/llm.yml
+#     use_in_slugs:
+#       - <你的组织>/polyglot-media-summarizer
+#   密钥仓库 llm.yml 内容：
+#     HF_TOKEN: hf_xxxxxxxxxxxxxxxxxxxx
+#     DEEPSEEK_API_KEY: sk-xxxxxxxxxxxxxxxxxxxx
+#
+# 方式 B（仓库级）：在 `vscode` 的列表项中加一行
+#   imports: https://cnb.cool/<你的密钥仓库>/-/blob/main/llm.yml
+#
+# 注入后容器内可直接 `echo $HF_TOKEN` 验证；.cnb.yml 显式 env 优先级最高，
+# 个人环境变量次之（会覆盖仓库 imports）。
+#
+# 前置条件：到 https://hf.co/pyannote/speaker-diarization-3.1 用同一个 HF 账号接受许可，
+# 否则 Pyannote 加载会 403。
+# ---------------------------------------------------------------------------
