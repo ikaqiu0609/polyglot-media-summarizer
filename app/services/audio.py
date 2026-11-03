@@ -11,6 +11,11 @@
     - -nostdin 防止 FFmpeg 抢占父进程 stdin（FastAPI 后台任务里很关键）；
     - 切片用 -ss/-t + -c:a copy，PCM 直接拷贝不重编码，3 小时音频切片几秒完成；
     - 切片起点由 plan_chunks() 纯函数计算，误差只可能是 PCM packet 对齐量级（~64ms）。
+
+跨平台（Linux 容器 / Windows 本地）：
+    - 可执行文件不写死路径，按「环境变量 → PATH → Windows 常见安装目录」顺序解析；
+    - 所有路径都用 pathlib.Path，数据目录默认是「项目根目录/data」（见 app/config.py）；
+    - Windows 下通过 CREATE_NO_WINDOW 抑制 FFmpeg 的控制台窗口。
 """
 
 from __future__ import annotations
@@ -26,13 +31,63 @@ import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from app.config import resolve_path
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # 可配置项（全部允许用环境变量覆盖）
 # ---------------------------------------------------------------------------
-FFMPEG_BIN = os.getenv("FFMPEG_BIN", "ffmpeg")
-FFPROBE_BIN = os.getenv("FFPROBE_BIN", "ffprobe")
+# Windows 上 ffmpeg 常装在非 PATH 目录（winget/scoop/chocolatey/手动解压），作为兜底探测
+_WINDOWS_FALLBACK_DIRS: tuple[str, ...] = (
+    r"C:\ffmpeg\bin",
+    r"C:\Program Files\ffmpeg\bin",
+    r"C:\ProgramData\chocolatey\bin",
+    os.path.expandvars(r"%USERPROFILE%\scoop\shims"),
+    os.path.expandvars(r"%LOCALAPPDATA%\Microsoft\WinGet\Links"),
+)
+
+# 0 在 POSIX 上是合法值（等价于不设置），非 Windows 不要传 CREATE_NO_WINDOW
+_NO_WINDOW_FLAGS = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+
+
+def _resolve_binary(env_name: str, exe_name: str) -> str:
+    """解析 ffmpeg / ffprobe 的可执行文件路径。
+
+    解析顺序：
+        1. 环境变量 FFMPEG_BIN / FFPROBE_BIN —— 可写绝对路径，也可写裸命令名
+        2. PATH —— shutil.which 会按平台自动补 .exe / .cmd 等后缀
+        3. Windows 常见安装目录（兜底）
+        4. 仍未找到则返回裸命令名，交给 subprocess 报错（错误信息里带修复建议）
+    """
+    override = os.getenv(env_name)
+    if override:
+        candidate = resolve_path(override)
+        if candidate.exists():
+            return str(candidate)
+        found = shutil.which(override)  # 允许 FFMPEG_BIN=ffmpeg 这种裸命令名
+        if found:
+            return found
+        logger.warning("%s=%s 不存在，回退到自动查找", env_name, override)
+
+    found = shutil.which(exe_name)
+    if found:
+        return found
+
+    if os.name == "nt":
+        for directory in _WINDOWS_FALLBACK_DIRS:
+            if not directory:
+                continue
+            candidate = Path(directory) / f"{exe_name}.exe"
+            if candidate.exists():
+                logger.info("在 %s 找到 %s", candidate.parent, exe_name)
+                return str(candidate)
+
+    return exe_name
+
+
+FFMPEG_BIN = _resolve_binary("FFMPEG_BIN", "ffmpeg")
+FFPROBE_BIN = _resolve_binary("FFPROBE_BIN", "ffprobe")
 
 SAMPLE_RATE = 16_000                                    # Whisper 系列固定 16k
 CHANNELS = 1
@@ -40,8 +95,8 @@ CHUNK_MINUTES = float(os.getenv("CHUNK_MINUTES", "15"))  # 单文件最长时长
 FFMPEG_TIMEOUT = int(os.getenv("FFMPEG_TIMEOUT", "1800"))  # 单次 FFmpeg 调用超时（秒）
 MIN_CHUNK_SEC = 1.0                                     # 小于该时长的尾片直接丢弃
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-DATA_ROOT = Path(os.getenv("DATA_ROOT", str(PROJECT_ROOT / "data")))
+# 数据目录：DATA_ROOT 支持相对路径（相对项目根）或绝对路径，默认 <项目根>/data
+DATA_ROOT = resolve_path(os.getenv("DATA_ROOT") or "data")
 AUDIO_DIR = DATA_ROOT / "audio"
 
 SUPPORTED_EXTS = {
@@ -110,10 +165,13 @@ def run_command(cmd: list[str], stage: str, timeout: int | None = FFMPEG_TIMEOUT
             stderr=subprocess.PIPE,
             timeout=timeout,
             check=False,
+            creationflags=_NO_WINDOW_FLAGS,  # Windows 下不弹控制台窗口；POSIX 上传 0 无影响
         )
     except FileNotFoundError as exc:  # 二进制不存在
         raise AudioProcessingError(
-            f"未找到可执行文件 {cmd[0]}，请确认镜像已安装 ffmpeg"
+            f"未找到可执行文件 {cmd[0]!r}。请安装 FFmpeg 并加入 PATH，"
+            f"或用环境变量 FFMPEG_BIN / FFPROBE_BIN 指定绝对路径"
+            f"（Windows 示例：FFMPEG_BIN=C:/ffmpeg/bin/ffmpeg.exe）"
         ) from exc
     except subprocess.TimeoutExpired as exc:
         raise AudioProcessingError(
@@ -132,14 +190,19 @@ def run_command(cmd: list[str], stage: str, timeout: int | None = FFMPEG_TIMEOUT
 
 
 def check_ffmpeg() -> dict:
-    """启动自检：确认 ffmpeg/ffprobe 可用，返回版本信息。"""
+    """启动自检：确认 ffmpeg/ffprobe 可用，返回版本信息（含解析后的路径）。"""
     info: dict[str, str] = {}
     for name, binary in (("ffmpeg", FFMPEG_BIN), ("ffprobe", FFPROBE_BIN)):
-        path = shutil.which(binary)
+        # binary 可能是绝对路径（已解析）也可能是裸命令名，两种都兼容
+        path = str(binary) if Path(binary).is_file() else shutil.which(binary)
         if not path:
-            raise AudioProcessingError(f"环境缺少 {name}（{binary}），请重新构建镜像")
+            raise AudioProcessingError(
+                f"环境缺少 {name}。请安装 FFmpeg 并加入 PATH，"
+                f"或设置环境变量 {name.upper()}_BIN 指向可执行文件。"
+            )
         out = run_command([path, "-version"], stage=f"{name}-version", timeout=30)
-        info[name] = out.splitlines()[0].strip() if out else "unknown"
+        info[name] = out.splitlines()[0].strip() if out else f"unknown ({path})"
+        info[f"{name}_path"] = path
     logger.info("ffmpeg 自检通过: %s", info)
     return info
 

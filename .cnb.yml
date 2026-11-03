@@ -4,7 +4,8 @@
 #   2. GPU 通过 runner.tags 选择节点：cnb:arch:amd64:gpu（固定 16 核 / 48GB 显存 / 最长 18h）；
 #      GPU 节点 CPU 核数是固定的，写 runner.cpus 无意义，故不配置；
 #   3. 密钥（HF_TOKEN / DEEPSEEK_API_KEY）**不写进本文件**，走「个人环境变量」或密钥仓库 imports 注入，
-#      见文件末尾注释。
+#      见文件末尾注释；
+#   4. 本文件的 env 只对云端 Linux 容器生效；Windows 本地运行请用项目根目录的 .env（模板见 .env.example）。
 $: # 兜底分支
   vscode:
     - name: gpu-dev
@@ -33,14 +34,27 @@ $: # 兜底分支
         # 开发环境保活时间：2 小时无 IDE/SSH 心跳才回收，默认仅 10 分钟
         keepAliveTimeout: 2h
       # ---------------- 启动后的自检任务 ----------------
+      # 说明：与业务代码走同一套解析逻辑（app.config / app.services.audio），
+      #       所以这里打印出的 ffmpeg 路径 = 服务实际会用到的那个；每行都自带兜底，
+      #       保证 4 项检查即使某项失败也会全部跑完。
       stages:
         - name: 环境自检
           # 自检失败不影响开发环境使用
           allowFailure: true
           script:
-            - nvidia-smi || echo "未检测到 GPU，请确认仓库/组织是否开通 GPU 节点"
-            - ffmpeg -version | head -n 1
-            - python -c "import torch, murmurai; print('torch', torch.__version__, '| cuda', torch.cuda.is_available(), '| murmurai', getattr(murmurai, '__version__', 'ok'))"
+            - |
+              echo "=== 1/4 GPU ==="
+              nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader || echo "[warn] 未检测到 GPU，请确认仓库/组织是否开通 GPU 节点"
+
+              echo "=== 2/4 FFmpeg（路径解析与业务代码一致）==="
+              ffmpeg -version 2>/dev/null | head -n 1 || echo "[warn] PATH 中找不到 ffmpeg"
+              python -c "from app.services.audio import check_ffmpeg; i = check_ffmpeg(); print('解析到的 ffmpeg  =', i['ffmpeg_path']); print('解析到的 ffprobe =', i['ffprobe_path'])" || echo "[warn] ffmpeg 自检失败"
+
+              echo "=== 3/4 Python 依赖 ==="
+              python -c "import torch, murmurai, openai, fastapi; print('torch', torch.__version__, '| cuda', torch.cuda.is_available(), '| murmurai', getattr(murmurai, '__version__', 'ok'), '| fastapi', fastapi.__version__)" || echo "[warn] 依赖导入失败（torch / murmurai / openai / fastapi）"
+
+              echo "=== 4/4 配置与数据目录 ==="
+              python -c "from app.config import settings; settings.ensure_dirs(); print('data_root =', settings.data_root); print('hf_token_present =', settings.hf_token_present); print('deepseek_key_present =', settings.deepseek_key_present); print('asr_model =', settings.asr_model, '| chunk_minutes =', settings.chunk_minutes)" || echo "[warn] 配置加载失败"
 
 # ---------------------------------------------------------------------------
 # 密钥注入方式（二选一，切勿把 Token 明文提交到仓库）

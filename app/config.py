@@ -4,6 +4,16 @@
     audio / transcribe / summarizer 三个服务模块里仍保留了各自的模块级常量
     （便于单独 `python -m` 跑 CLI），但它们的关键参数都支持函数入参覆盖，
     main.py 一律显式传入 `settings` 里的值，因此运行时以本文件为准。
+
+环境变量来源（后者不覆盖前者）：
+    1. 系统环境变量 —— 云端（cnb.cool）由平台直接注入
+    2. 项目根目录的 `.env` —— 本地 Windows / macOS / Linux 开发用（python-dotenv）
+
+跨平台约定：
+    - 路径全部用 pathlib.Path，代码里不出现写死的 /workspace、/tmp 之类绝对路径
+    - 配置里的**相对路径一律相对项目根目录**解析，而不是当前工作目录
+      （Windows 下从别的盘符启动 uvicorn 时，CWD 经常不是项目根）
+    - 支持 `~/data`、`%USERPROFILE%\\data`、`$HOME/data` 等写法
 """
 
 from __future__ import annotations
@@ -13,8 +23,34 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-# app/config.py -> 项目根目录
+# app/config.py -> 项目根目录（Windows 上同样是绝对路径，例如 D:\code\polyglot-media-summarizer）
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+ENV_FILE = PROJECT_ROOT / ".env"
+
+try:
+    from dotenv import load_dotenv
+except ImportError:  # 未安装 python-dotenv 时退化为「只读系统环境变量」，不影响云端运行
+    load_dotenv = None  # type: ignore[assignment]
+else:
+    # encoding="utf-8"：Windows 默认按 cp936 读文件，.env 里写中文注释会 UnicodeDecodeError
+    # override=False：系统环境变量优先，云端注入的密钥不会被本地 .env 意外覆盖
+    # 文件不存在时 load_dotenv 静默返回 False，容器/云端场景无副作用
+    load_dotenv(dotenv_path=ENV_FILE, encoding="utf-8", override=False)
+
+
+def resolve_path(raw: str | Path, base: Path = PROJECT_ROOT) -> Path:
+    """把配置里的路径解析成跨平台的绝对路径。
+
+    :param raw:  原始值，可含 `~`、`%USERPROFILE%`、`$HOME`，也可为相对路径
+    :param base: 相对路径的基准目录（默认项目根目录）
+    """
+    text = str(raw).strip()
+    # Windows 的 ntpath 会展开 %VAR%，POSIX 的 posixpath 会展开 $VAR，两边都安全
+    expanded = Path(os.path.expandvars(os.path.expanduser(text)))
+    if not expanded.is_absolute():
+        expanded = base / expanded
+    # Windows 上盘符路径也能正常 resolve；strict=False 允许目标尚不存在
+    return expanded.resolve()
 
 DEFAULT_MEDIA_EXTENSIONS: tuple[str, ...] = (
     ".mp4", ".mkv", ".mov", ".webm", ".flv", ".avi", ".m4v", ".ts",
@@ -57,8 +93,9 @@ def _env_bool(name: str, default: bool) -> bool:
 
 
 def _env_path(name: str, default: Path) -> Path:
+    """读取路径型环境变量：相对路径按项目根目录解析（不依赖 CWD）。"""
     raw = _env(name)
-    return Path(raw).expanduser().resolve() if raw else default
+    return resolve_path(raw) if raw else default
 
 
 def _env_set(name: str, default: tuple[str, ...]) -> frozenset[str]:

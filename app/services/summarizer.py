@@ -23,6 +23,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Sequence
 
+from app.config import resolve_path
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -40,7 +42,8 @@ AGG_MAX_CHARS = int(os.getenv("AGG_MAX_CHARS", "24000"))
 MAX_RETRIES = int(os.getenv("DEEPSEEK_MAX_RETRIES", "3"))
 REQUEST_TIMEOUT = float(os.getenv("DEEPSEEK_TIMEOUT", "180"))
 
-OUTPUT_DIR = Path(os.getenv("DATA_ROOT", str(Path(__file__).resolve().parents[2] / "data"))) / "outputs"
+# 相对路径按项目根目录解析（Windows 下 CWD 可能不是项目根），不写死任何绝对路径
+OUTPUT_DIR = resolve_path(os.getenv("DATA_ROOT") or "data") / "outputs"
 
 
 class SummarizationError(RuntimeError):
