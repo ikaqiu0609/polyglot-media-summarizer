@@ -34,11 +34,27 @@ $: # 兜底分支
       options:
         # 开发环境保活时间：2 小时无 IDE/SSH 心跳才回收，默认仅 10 分钟
         keepAliveTimeout: 2h
-      # ---------------- 启动后的自检任务 ----------------
-      # 说明：与业务代码走同一套解析逻辑（app.config / app.services.audio），
-      #       所以这里打印出的 ffmpeg 路径 = 服务实际会用到的那个；每行都自带兜底，
-      #       保证 4 项检查即使某项失败也会全部跑完。
+      # ---------------- 启动后的任务 ----------------
+      # 说明：镜像由上面的 docker.build 构建，构建上下文里只有 Dockerfile
+      #       （docker.build 不配 by 时不会带仓库文件），所以 Python 依赖放在这里装；
+      #       装进 /workspace/.venv，工作区保留期内不用重装。
       stages:
+        - name: 安装依赖
+          # 依赖装失败也不拦开发环境启动，问题交给下面的自检暴露
+          allowFailure: true
+          script:
+            - |
+              cd /workspace
+              if [ -f .venv/bin/activate ] && [ .venv -nt requirements.txt ]; then
+                echo "[skip] .venv 已存在且比 requirements.txt 新"
+              else
+                python3 -m venv .venv
+                . .venv/bin/activate
+                pip install --no-cache-dir --upgrade pip
+                pip install --no-cache-dir -r requirements.txt
+              fi
+              python -c "import torch; print('torch', torch.__version__, 'cuda_available', torch.cuda.is_available())"
+
         - name: 环境自检
           # 自检失败不影响开发环境使用
           allowFailure: true
@@ -47,15 +63,20 @@ $: # 兜底分支
               echo "=== 1/4 GPU ==="
               nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader || echo "[warn] 未检测到 GPU，请确认仓库/组织是否开通 GPU 节点"
 
+              cd /workspace
+              # 优先用「安装依赖」装好的 .venv，没有就退回系统 python
+              if [ -x .venv/bin/python ]; then PY=/workspace/.venv/bin/python; else PY=python; fi
+              echo "使用解释器: $PY"
+
               echo "=== 2/4 FFmpeg（路径解析与业务代码一致）==="
               ffmpeg -version 2>/dev/null | head -n 1 || echo "[warn] PATH 中找不到 ffmpeg"
-              python -c "from app.services.audio import check_ffmpeg; i = check_ffmpeg(); print('解析到的 ffmpeg  =', i['ffmpeg_path']); print('解析到的 ffprobe =', i['ffprobe_path'])" || echo "[warn] ffmpeg 自检失败"
+              $PY -c "from app.services.audio import check_ffmpeg; i = check_ffmpeg(); print('解析到的 ffmpeg  =', i['ffmpeg_path']); print('解析到的 ffprobe =', i['ffprobe_path'])" || echo "[warn] ffmpeg 自检失败"
 
               echo "=== 3/4 Python 依赖 ==="
-              python -c "import torch, murmurai, openai, fastapi; print('torch', torch.__version__, '| cuda', torch.cuda.is_available(), '| murmurai', getattr(murmurai, '__version__', 'ok'), '| fastapi', fastapi.__version__)" || echo "[warn] 依赖导入失败（torch / murmurai / openai / fastapi）"
+              $PY -c "import torch, murmurai, openai, fastapi; print('torch', torch.__version__, '| cuda', torch.cuda.is_available(), '| murmurai', getattr(murmurai, '__version__', 'ok'), '| fastapi', fastapi.__version__)" || echo "[warn] 依赖导入失败（torch / murmurai / openai / fastapi）"
 
               echo "=== 4/4 配置与数据目录 ==="
-              python -c "from app.config import settings; settings.ensure_dirs(); print('data_root =', settings.data_root); print('hf_token_present =', settings.hf_token_present); print('deepseek_key_present =', settings.deepseek_key_present); print('asr_model =', settings.asr_model, '| chunk_minutes =', settings.chunk_minutes)" || echo "[warn] 配置加载失败"
+              $PY -c "from app.config import settings; settings.ensure_dirs(); print('data_root =', settings.data_root); print('hf_token_present =', settings.hf_token_present); print('deepseek_key_present =', settings.deepseek_key_present); print('asr_model =', settings.asr_model, '| chunk_minutes =', settings.chunk_minutes)" || echo "[warn] 配置加载失败"
 
 # ---------------------------------------------------------------------------
 # 密钥注入方式（二选一，切勿把 Token 明文提交到仓库）

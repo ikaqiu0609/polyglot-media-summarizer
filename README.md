@@ -195,9 +195,14 @@ DEEPSEEK_API_KEY: sk-xxxxxxxxxxxxxxxxxxxx
 1. 打开你 Fork 出来的仓库，进入**任意分支页面**（不是设置页）。
 2. 点页面**右上角**的「云原生开发」。
 3. 选 **WebIDE**（浏览器直接打开，免安装）；想用本地编辑器可选 VS Code / Cursor。
-4. 首次启动会按 `Dockerfile` 构建镜像（CUDA + torch + ffmpeg），**约 10~20 分钟**；之后命中缓存，几十秒就绪。
+4. 首次启动会按 `Dockerfile` 构建镜像（CUDA + torch + ffmpeg，**不含业务代码和 pip 依赖**），**约 10~20 分钟**；之后命中缓存，几十秒就绪。
+5. 镜像就绪后自动跑「安装依赖」：在 `/workspace/.venv` 里 `pip install -r requirements.txt`（首次 3~8 分钟，之后 `.venv` 随工作区保留，直接跳过）。
 
-启动后会自动跑一次「环境自检」，终端里能看到 4 段输出，重点看这几行：
+> 为什么依赖不在镜像里装：`docker.build` 的构建上下文只有 `Dockerfile`
+> （不配 `by` 时仓库文件不会被送进去），在 Dockerfile 里 `COPY requirements.txt` 会直接报
+> `"/requirements.txt": not found`，整个 Prepare 阶段失败。改在 stage 里装，代码和依赖走同一个工作区，也不会因为改一行代码就重建镜像。
+
+接着跑「环境自检」，终端里能看到 4 段输出，重点看这几行：
 
 ```
 === 1/4 GPU ===
@@ -216,10 +221,11 @@ deepseek_key_present = True                  ← 同上
 
 ### A5. 启动服务
 
-在 WebIDE 的终端里（代码目录是 `/workspace`，与 `Dockerfile` 的 `WORKDIR` 一致）：
+依赖装在 `/workspace/.venv`，**先激活虚拟环境**再起服务（代码目录是 `/workspace`，与 `Dockerfile` 的 `WORKDIR` 一致）：
 
 ```bash
 cd /workspace
+source .venv/bin/activate
 python -m uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 
@@ -259,6 +265,8 @@ echo "$CNB_VSCODE_PROXY_URI" | sed "s/{{port}}/8000/"
 | 浏览器打不开 8000 | 服务监听了 `127.0.0.1`，或没加端口映射 | 用 `--host 0.0.0.0`，并在 PORTS 面板加 8000 |
 | Pyannote 报 403 | 没接受模型条款 | 回「0. 先准备三样东西」第 2 条 |
 | 首次启动卡在构建很久 | 要拉 6~8GB 基础镜像 | 正常现象，等它跑完；后续命中缓存 |
+| Prepare 阶段报 `"/requirements.txt": not found` | 在 Dockerfile 里 COPY 了仓库文件，但 `docker.build` 的上下文里没有它们 | 镜像不要 COPY 仓库文件，依赖在 stage 里装（当前配置已如此） |
+| `安装依赖` stage 很慢或失败 | 首次要装 pyannote / faster-whisper 等一堆包 | 第二次起 `.venv` 命中工作区；失败时看该 stage 日志，装好后 `source .venv/bin/activate` |
 
 ### A9. 备选：自有服务器的 Docker
 

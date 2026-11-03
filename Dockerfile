@@ -54,21 +54,22 @@ RUN curl -fsSL https://code-server.dev/install.sh | sh \
     && echo "code-server installed"
 
 # ---------------------------------------------------------------------------
-# 3) Python 依赖
-#    注意：requirements.txt 里不要写 torch，交给基础镜像提供；
-#    murmurai-core 会顺带安装 pyannote-audio(>=4.x)、faster-whisper、ctranslate2、torchcodec 等。
-#    pip 会额外装一个 nvidia-cudnn-cu12（>700MB），与镜像自带 cuDNN9 同大版本，可共存。
+# 3) 工作区目录
+#    Python 依赖不在这里装（见下）。
 # ---------------------------------------------------------------------------
 WORKDIR /workspace
-COPY requirements.txt /tmp/requirements.txt
-RUN pip install --no-cache-dir --upgrade pip \
-    && pip install --no-cache-dir -r /tmp/requirements.txt \
-    && python -c "import torch; print('torch', torch.__version__, 'cuda_available', torch.cuda.is_available())"
+
+# 注意：这里**不要** COPY 仓库文件。
+#   本环境镜像由 CNB 的 docker.build 构建，构建上下文只有 Dockerfile 和 [by] 白名单里的文件，
+#   不加 by 时上下文里没有 requirements.txt / app/，COPY 会直接报
+#   `failed to calculate checksum ... "/requirements.txt": not found`（Prepare 阶段挂掉）。
+#   Python 依赖改在 .cnb.yml 的「安装依赖」stage 里装，进 /workspace/.venv 并随工作区保留。
 
 # ---------------------------------------------------------------------------
-# 4) 业务代码（放在依赖之后，改代码不会导致重装依赖）
+# 4) 数据目录
+#    业务代码不 COPY 进镜像：平台会把仓库检出到 /workspace，镜像里的副本只会被覆盖，
+#    还会让镜像哈希随代码变动、每次都失效缓存。
 # ---------------------------------------------------------------------------
-COPY . /workspace
 RUN mkdir -p /workspace/data/uploads /workspace/data/audio /workspace/data/outputs \
     && chmod -R 777 /workspace/data
 
