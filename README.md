@@ -83,6 +83,7 @@
 ├── Dockerfile                   # CUDA + torch2.9 + ffmpeg + code-server
 ├── requirements.txt             # Python 依赖（torch 由基础镜像提供，Windows 需手动装）
 ├── .env.example                 # 本地环境变量模板（复制为 .env，已 gitignore）
+├── run.bat                      # 【日常入口】双击即启动（转调 scripts\start-local.bat）
 ├── app/
 │   ├── config.py                # 环境变量集中读取（Settings）
 │   ├── main.py                  # FastAPI 接口 + 后台任务编排
@@ -460,6 +461,8 @@ rem 不要用 setx 改 PATH：超过 1024 字符会被截断，还会把系统�
 
 > PowerShell 等价写法：`$env:PATH = "$PWD\.venv\Lib\site-packages\nvidia\cudnn\bin;$env:PATH"`。
 > `set` / `$env:` 都只影响**当前窗口**，关掉就失效——所以之后启动服务的那个窗口要先执行过一次，或者直接用上面的「永久生效」方式。
+>
+> ✅ **用 `run.bat` 启动就不用管这些**：启动脚本会自动把 `.venv\Lib\site-packages\nvidia\cudnn\bin` 加进本次会话的 PATH（只影响该进程，不写系统变量）。上面这些手工设置只在你**自己手敲 `python -m uvicorn`** 时才需要。
 
 验证（两条都要过）：
 
@@ -521,14 +524,34 @@ curl.exe -s http://127.0.0.1:8000/status/<task_id>
 
 ### B10. 关闭与下次启动
 
-- 关闭：在运行服务的窗口按 `Ctrl + C`。
-- 下次启动（三步）：
+- 关闭：在运行服务的窗口按 `Ctrl + C`（或直接关窗口）。
+
+**下次启动（推荐：一步）**
+
+关机重开后，**不需要重装任何东西**：不用再 `pip install`、不用重建 `.venv`、模型也不会重新下载（都在 `%USERPROFILE%\.cache\huggingface`）。只要：
+
+1. 打开项目文件夹（资源管理器）；
+2. 双击 **`run.bat`**。
+
+等价于在 cmd 里：
+
+```bat
+cd /d "%USERPROFILE%\Documents\polyglot-media-summarizer"
+run.bat
+```
+
+脚本会自动完成：定位 `.venv`（不用激活）→ 把 venv 里的 cuDNN 9 加进本次会话的 PATH（**这一条很关键**，否则重启后转录会静默跑在 CPU 上，慢十倍）→ 检查端口 → 启动 uvicorn → 打开 `/docs`。
+
+**手动启动（不想用脚本时）**
 
 ```bat
 cd /d "%USERPROFILE%\Documents\polyglot-media-summarizer"
 .venv\Scripts\activate.bat
+set "PATH=%CD%\.venv\Lib\site-packages\nvidia\cudnn\bin;%PATH%"
 python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
 ```
+
+> 第 3 行只在「没做永久 PATH」时需要（见 B6）。忘了加也不会报错，只是转录会退回 CPU 变得很慢。
 
 ### B11. 本地排错
 
@@ -542,7 +565,7 @@ python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
 | `pip` 报 `torchvision ... requires torch>=x.y` | 旧环境遗留的 torchvision 与被降级/换版的 torch 不配套 | 本项目不用它：`pip uninstall -y torchvision`，再 `pip check` |
 | `torch.cuda.is_available()` 是 False | 装成了 CPU 版 | 按 B5 重装 cu128 版 |
 | `ct2 cuda devices: 0` | 缺 cuDNN 9 DLL | 按 B6 处理 |
-| 转录极慢、任务管理器里 GPU 占用接近 0 | 同上，已静默退回 CPU | 同上 |
+| 转录极慢、任务管理器里 GPU 占用接近 0 | 已静默退回 CPU：缺少 cuDNN 9 的 DLL（重启后新窗口丢了 PATH 是最常见原因） | 用 `run.bat` 启动会自动注入 PATH；仍为 0 则按 B6 装 `nvidia-cudnn-cu12` 并跑 `scripts\check-env.bat` 第 5 项确认 |
 | `未找到可执行文件 'ffmpeg'` | 没进 PATH | 按 B3 设 `FFMPEG_BIN` |
 | `OSError: [WinError 1455] 页面文件太小` | 虚拟内存不足（torch + 模型同时加载） | 系统属性 → 高级 → 性能设置 → 高级 → 虚拟内存，调到 16GB 以上 |
 | 启动报 `[Errno 10048]` 端口占用 | 8000 被别的程序占了 | 换 `--port 8001` |
@@ -555,6 +578,7 @@ python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
 
 | 脚本 | 作用 | cmd 用法 | PowerShell 用法 |
 |---|---|---|---|
+| `run`（项目根目录） | **日常入口**：部署完成后只需双击它，等价于 `scripts\start-local.bat`。命名刻意避开 `start`——那是 cmd 的内建命令，敲 `start` 会开新窗口而不是运行脚本 | `run.bat` | `.\run.bat` |
 | `check-env` | 8 项自检：Python 版本 / 依赖 / torch-CUDA / cuDNN / FFmpeg / 密钥 / 数据目录 / 显存与模型档位是否匹配 | `scripts\check-env.bat` | `.\scripts\check-env.ps1` |
 | `start-local` | 定位虚拟环境（自动识别 `.venv` / `venv`）→ 检查端口 → 启动 uvicorn → 自动打开 `/docs` | `scripts\start-local.bat` | `.\scripts\start-local.ps1` |
 

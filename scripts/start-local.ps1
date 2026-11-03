@@ -130,7 +130,25 @@ if (-not (Test-Path $python)) {
     & $python -m pip install torch==2.9.0 torchaudio==2.9.0 --index-url https://download.pytorch.org/whl/cu128
     & $python -m pip install -r requirements.txt
     & $python -m pip check
-    Write-Host "[OK] 依赖安装完成；建议先跑一次 .\scripts\check-env.ps1" -ForegroundColor Green
+    Write-Host "[OK] 依赖安装完成；建议先跑一次 scripts\check-env.bat" -ForegroundColor Green
+}
+
+# ---------------------------------------------------------------------------
+# 1.5 把 venv 里的 cuDNN 9 补进「本次会话」的 PATH
+#   为什么需要：README B6 里那条 `set PATH=...` 只对当时那个窗口有效，关机或新开
+#   窗口就没了；而 ctranslate2 找不到 cuDNN 9 时**不会报错，只会静默退回 CPU**
+#   （表现为"第一次很快，重启后突然慢十倍"）。
+#   - 目录从虚拟环境路径反推，所以 .venv / venv / env 三种命名都能覆盖
+#   - 只影响当前进程及其拉起的 uvicorn，不写系统 PATH、不污染其他项目
+#   - 没装 nvidia-cudnn-cu12（或已用系统级 cuDNN）时静默跳过
+# ---------------------------------------------------------------------------
+$venvRoot = Split-Path -Parent (Split-Path -Parent $python)
+$cudnnBin = Join-Path $venvRoot "Lib\site-packages\nvidia\cudnn\bin"
+if (Test-Path $cudnnBin) {
+    if (($env:PATH -split ';') -notcontains $cudnnBin) {
+        $env:PATH = "$cudnnBin;$env:PATH"
+    }
+    Write-Host "[OK] cuDNN 9 已加入本次会话 PATH：$cudnnBin" -ForegroundColor DarkGray
 }
 
 # ---------------------------------------------------------------------------

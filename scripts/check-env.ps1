@@ -90,6 +90,19 @@ if ($usingVenv) {
     Hint "建议先执行 B5：py -0p 看版本，再 py -3.13 -m venv .venv 并安装依赖"
 }
 
+# 与 start-local.ps1 保持一致：先把 venv 里的 cuDNN 9 补进本次会话 PATH，再探测。
+# 否则每次新开窗口自检都会误报「ctranslate2 看不到 GPU」，而实际启动时是好的。
+if ($usingVenv) {
+    $venvRoot = Split-Path -Parent (Split-Path -Parent $Python)
+    $cudnnBin = Join-Path $venvRoot "Lib\site-packages\nvidia\cudnn\bin"
+    if (Test-Path $cudnnBin) {
+        if (($env:PATH -split ';') -notcontains $cudnnBin) {
+            $env:PATH = "$cudnnBin;$env:PATH"
+        }
+        Write-Host "         cuDNN 9 已加入本次会话 PATH（与启动脚本行为一致）" -ForegroundColor DarkGray
+    }
+}
+
 # ---------------------------------------------------------------------------
 # 2. 一次性探测（写成临时 .py 再执行，避免超长命令行与引号转义问题）
 # ---------------------------------------------------------------------------
@@ -249,7 +262,8 @@ if ($null -ne $info.ct2_devices) {
         Ok "ctranslate2 检测到 $($info.ct2_devices) 个 CUDA 设备（cuDNN 9 已就绪）"
     } else {
         Fail "ctranslate2 看不到 CUDA 设备 —— 缺 cuDNN 9 的 DLL，转录会静默退回 CPU"
-        Hint "pip install ""nvidia-cudnn-cu12==9.*""，再把 .venv\Lib\site-packages\nvidia\cudnn\bin 加入 PATH"
+        Hint "先装：pip install ""nvidia-cudnn-cu12==9.*"""
+        Hint "装好后不用手工设 PATH：scripts\start-local.bat 启动时会自动注入（本自检也已自动注入）"
         Hint "详解见 README B6"
     }
 } else {
