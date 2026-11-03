@@ -4,7 +4,6 @@ data/
 models/
 .git/
 .venv/
-venv/
 __pycache__/
 *.py[cod]
 *.wav
