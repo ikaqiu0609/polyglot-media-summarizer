@@ -60,15 +60,10 @@ RUN curl -fsSL https://code-server.dev/install.sh | sh \
 #    pip 会额外装一个 nvidia-cudnn-cu12（>700MB），与镜像自带 cuDNN9 同大版本，可共存。
 # ---------------------------------------------------------------------------
 WORKDIR /workspace
-COPY requirements.txt /tmp/requirements.txt
-RUN pip install --no-cache-dir --upgrade pip \
-    && pip install --no-cache-dir -r /tmp/requirements.txt \
-    && python -c "import torch; print('torch', torch.__version__, 'cuda_available', torch.cuda.is_available())"
 
 # ---------------------------------------------------------------------------
 # 4) 业务代码（放在依赖之后，改代码不会导致重装依赖）
 # ---------------------------------------------------------------------------
-COPY . /workspace
 RUN mkdir -p /workspace/data/uploads /workspace/data/audio /workspace/data/outputs \
     && chmod -R 777 /workspace/data
 
