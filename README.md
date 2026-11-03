@@ -258,7 +258,9 @@ echo "$CNB_VSCODE_PROXY_URI" | sed "s/{{port}}/8000/"
 | 自检 `cuda False` | 没分到 GPU 节点 | 确认 `.cnb.yml` 里 `runner.tags: cnb:arch:amd64:gpu`；联系组织管理员开通 GPU 配额 |
 | 浏览器打不开 8000 | 服务监听了 `127.0.0.1`，或没加端口映射 | 用 `--host 0.0.0.0`，并在 PORTS 面板加 8000 |
 | Pyannote 报 403 | 没接受模型条款 | 回「0. 先准备三样东西」第 2 条 |
-| 首次启动卡在构建很久 | 要拉 6~8GB 基础镜像 | 正常现象，等它跑完；后续命中缓存 |
+| 首次启动卡在构建很久 | 要拉 6~8GB 基础镜像 + 装 torch 系依赖 | 正常现象，等它跑完；后续命中缓存 |
+| 构建报 `COPY ... failed to calculate checksum ...: "/requirements.txt": not found` | `.cnb.yml` 里 `build:` 写成了字符串，CNB 的构建上下文因此只有 Dockerfile 自己 | 改成对象写法：`build: { dockerfile: Dockerfile, by: [requirements.txt] }`；Dockerfile 里 COPY 了哪些文件，`by` 就要列全哪些 |
+| 打开 IDE 没有 CodeBuddy / 插件全没了、终端只剩 bash | 镜像里装了 code-server → 走「单容器模式」，顶掉了 CNB 默认环境（`cnbcool/default-dev-env` 里预装 CodeBuddy 等） | 在 Dockerfile 里 `code-server --install-extension tencent-cloud.coding-copilot`（本仓库已内置）；或删掉镜像里的 code-server 回到双容器模式 |
 
 ### A9. 备选：自有服务器的 Docker
 
@@ -271,11 +273,13 @@ docker build -t pms:dev .
 docker run --gpus all -d --name pms \
   -e HF_TOKEN=hf_xxx -e DEEPSEEK_API_KEY=sk-xxx \
   -p 8000:8000 \
-  -v "$PWD/data:/workspace/data" \
+  -v "$PWD:/workspace" \
   -v pms-models:/workspace/.cache \
   pms:dev
 curl -s http://127.0.0.1:8000/healthz
 ```
+
+> 镜像里**不** COPY 业务代码（CNB 云原生开发的构建上下文只包含 `.cnb.yml` 里 `build.by` 声明的文件），所以要用 `-v "$PWD:/workspace"` 把仓库挂进容器，否则 `uvicorn app.main:app` 找不到 `app/`。
 
 前置条件：宿主机装好 NVIDIA 驱动与 [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html)，并确认下面这条能打印出显卡信息：
 

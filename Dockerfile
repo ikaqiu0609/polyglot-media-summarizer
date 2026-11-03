@@ -44,25 +44,52 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # ---------------------------------------------------------------------------
-# 2) code-server
+# 2) code-server + 预装扩展
 #    镜像内自带 code-server 时，CNB 云原生开发会以「单容器模式」启动（更省资源、启动更快）。
-#    若不需要网页版 IDE，可整段删除，届时会退化为双容器模式。
+#
+#    ⚠️ 单容器模式的代价：CNB 会直接用镜像里这个 code-server，不再额外拉起
+#    cnbcool/default-dev-env 容器，而 CodeBuddy（tencent-cloud.coding-copilot）、
+#    zsh 等默认工具都装在那个容器镜像里 —— 不在这里显式安装，打开 IDE 就会发现
+#    「AI 助手不见了，得去插件市场重装」。所以下面必须把要用的扩展装齐。
+#
+#    扩展用 `|| echo` 兜底：Open VSX 偶发抽风时不至于让整个环境构建失败。
 # ---------------------------------------------------------------------------
 RUN curl -fsSL https://code-server.dev/install.sh | sh \
-    && code-server --install-extension cnbcool.cnb-welcome \
-    && code-server --install-extension ms-python.python \
-    && echo "code-server installed"
+    && for ext in \
+         cnbcool.cnb-welcome \
+         tencent-cloud.coding-copilot \
+         ms-python.python \
+       ; do \
+         code-server --install-extension "$ext" \
+           || echo "[warn] 扩展安装失败（不阻断构建）: $ext"; \
+       done \
+    && code-server --list-extensions
 
 # ---------------------------------------------------------------------------
 # 3) Python 依赖
 #    注意：requirements.txt 里不要写 torch，交给基础镜像提供；
 #    murmurai-core 会顺带安装 pyannote-audio(>=4.x)、faster-whisper、ctranslate2、torchcodec 等。
 #    pip 会额外装一个 nvidia-cudnn-cu12（>700MB），与镜像自带 cuDNN9 同大版本，可共存。
+#
+#    ⚠️ CNB 云原生开发的构建上下文不是仓库根目录，而是 .cnb.yml 里
+#    docker.build.by 声明的那几个文件（外加 Dockerfile 自己）。
+#    所以这里 COPY 的 requirements.txt 必须在 by 里列出来，
+#    否则构建会直接失败：
+#      COPY requirements.txt /tmp/requirements.txt
+#      ERROR: failed to calculate checksum ...: "/requirements.txt": not found
 # ---------------------------------------------------------------------------
 WORKDIR /workspace
 
+COPY requirements.txt /tmp/requirements.txt
+RUN pip install --no-cache-dir --upgrade pip \
+    && pip install --no-cache-dir -r /tmp/requirements.txt \
+    && python -c "import torch; print('torch', torch.__version__, 'cuda_available', torch.cuda.is_available())"
+
 # ---------------------------------------------------------------------------
-# 4) 业务代码（放在依赖之后，改代码不会导致重装依赖）
+# 4) 运行时目录
+#    业务代码**不** COPY 进镜像：CNB 云原生开发把仓库直接挂载在 /workspace，
+#    镜像里再 COPY 一份既多余、又需要把整仓写进 build.by。
+#    想拿这个镜像独立跑（docker run），把仓库挂到 /workspace 即可，见 README A9。
 # ---------------------------------------------------------------------------
 RUN mkdir -p /workspace/data/uploads /workspace/data/audio /workspace/data/outputs \
     && chmod -R 777 /workspace/data

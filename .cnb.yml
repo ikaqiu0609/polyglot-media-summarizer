@@ -10,14 +10,29 @@ $: # 兜底分支
   vscode:
     - name: gpu-dev
       # ---------------- GPU 资源声明 ----------------
+      # 注意：这里是**故意注释掉的**，不是漏写。
+      #   原因：当前账号没有 GPU 额度，打开 tags 会因额度不足导致开发环境构建失败。
+      #   没有 GPU 时：torch.cuda.is_available() = False，容器里也没有 nvidia-smi；
+      #   app/services/transcribe.py 会自动 device=cpu、并把 float16 降级成 int8，
+      #   功能可用但转录极慢（large-v3 在 CPU 上基本没法用，临时调试请把 ASR_MODEL 调小）。
+      # 等有 GPU 额度后，取消下面两行注释即可（cnb:arch:amd64:gpu = 16 核 / 48GB 显存）。
       # runner:
         # cnb:arch:amd64:gpu 或 cnb:arch:amd64:gpu:L40（均为 amd64 / 16 核 / 48GB 显存）
-        # 日后发迹了记得打开。。。
         # tags: cnb:arch:amd64:gpu
       # ---------------- 开发环境镜像 ----------------
       docker:
         # 用仓库根目录的 Dockerfile 构建（内含 CUDA + torch2.9 + ffmpeg + murmurai-core）
-        build: Dockerfile
+        #
+        # ⚠️ 必须用「对象 + by」这种写法，不能写成 `build: Dockerfile`：
+        #    字符串写法等价于只指定了 dockerfile，构建上下文里除 Dockerfile 外什么都没有，
+        #    Dockerfile 里任何 COPY 都会失败，例如：
+        #      #10 [5/8] COPY requirements.txt /tmp/requirements.txt
+        #      ERROR: failed to calculate checksum ...: "/requirements.txt": not found
+        #    规则：Dockerfile 里 COPY/ADD 了哪些文件，by 里就要列全哪些（路径相对仓库根）。
+        build:
+          dockerfile: Dockerfile
+          by:
+            - requirements.txt
       services:
         - vscode # 网页版 IDE
         - docker # 需要 docker build / dind 时保留
@@ -26,6 +41,10 @@ $: # 兜底分支
         HF_HOME: /workspace/.cache/huggingface
         TORCH_HOME: /workspace/.cache/torch
         PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+        # 下面三项是「有 GPU」时的档位。当前没开 GPU 节点（见上方 runner 说明），
+        # 此时 transcribe.py 会自动 device=cpu 并把 float16 降级为 int8，
+        # 不会报错，但 large-v3 在 CPU 上慢到不可用 —— 纯调试请在启动命令里临时覆盖，
+        # 例如：ASR_MODEL=small ASR_COMPUTE_TYPE=int8 uvicorn app.main:app ...
         ASR_MODEL: large-v3
         ASR_COMPUTE_TYPE: float16
         ASR_BATCH_SIZE: "16"
