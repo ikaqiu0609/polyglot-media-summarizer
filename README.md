@@ -12,7 +12,10 @@
 - [核心特性](#核心特性)
 - [架构](#架构)
 - [目录结构](#目录结构)
-- [快速开始](#快速开始)
+- [部署总览](#部署总览)
+- [部署 A 云端](#部署-a-云端)
+- [部署 B Windows 本地](#部署-b-windows-本地)
+- [第一次使用](#第一次使用)
 - [API 参考](#api-参考)
 - [任务状态与进度](#任务状态与进度)
 - [产物与文件布局](#产物与文件布局)
@@ -87,6 +90,9 @@
 │       ├── audio.py             # FFmpeg 抽取与切片
 │       ├── transcribe.py        # 转录 + 说话人分离 + 边界合并
 │       └── summarizer.py        # DeepSeek 两阶段总结
+├── scripts/
+│   ├── check-env.ps1            # Windows 环境自检（B5/B6 的验证步骤打包）
+│   └── start-local.ps1          # Windows 一键启动（venv + 端口检查 + 开浏览器）
 └── data/                        # 运行时生成（已 gitignore）
     ├── uploads/                 # 原始上传文件
     ├── audio/                   # 16k wav / 切片（任务结束自动清理）
@@ -95,203 +101,476 @@
 
 ---
 
-## 快速开始
+## 部署总览
 
-三条路径，选一条走完即可（代码完全一致，只是运行环境与参数不同）：
+两条路，二选一，**代码完全一样**，区别只在「在哪台机器上跑」。
 
-| 路径 | 适合场景 | 显存要求 | 对应小节 |
-|---|---|---|---|
-| **云端 A**：cnb.cool 云原生开发 | 没有本地 GPU、想跑 `large-v3` | 48GB（平台提供） | 第 2 节 |
-| **云端 B**：Docker | 自有 GPU 服务器 / 团队统一环境 | ≥16GB | 第 3 节 |
-| **本地**：Windows 直装 | 一台 Windows 工作站（如 RTX 4070 8G） | ≥6GB | 第 4 节 |
-
-### 0. 前置条件
-
-| 项 | 云端（CNB / Docker） | Windows 本地 |
+| | 部署 A · 云端 | 部署 B · Windows 本地 |
 |---|---|---|
-| GPU | NVIDIA，≥16GB（`large-v3` + pyannote 峰值约 10~14GB） | RTX 4070 8GB 可用，但模型要降到 `medium` + `int8_float16` |
-| 运行时 | CUDA 12.8 基础镜像 / 宿主机装 NVIDIA Container Toolkit | CUDA 12.8 驱动 + **Python 3.10~3.13** + FFmpeg |
-| 账号 | [Hugging Face](https://huggingface.co) Token + [DeepSeek](https://platform.deepseek.com) API Key | 同左（写进 `.env`） |
-| HF 许可 | 用同一账号接受 <https://hf.co/pyannote/speaker-diarization-3.1> 的条款，否则 403 | 同左 |
+| 需要什么 | 一个 CNB 账号 + 浏览器 | 带 NVIDIA 显卡的 Windows 电脑 |
+| 显存 | 48GB（平台提供，可跑 `large-v3`） | ≥6GB（RTX 4070 8G 用 `medium`） |
+| 要装软件吗 | 不用，环境在云端镜像里 | 要装 Git / Python / FFmpeg |
+| 首次耗时 | 约 15~25 分钟（含镜像构建） | 约 40~60 分钟（含模型下载） |
+| 数据在哪 | 云端工作区（回收后在保留期内仍在） | 你自己的硬盘 `data/` |
+| 适合 | 没显卡、赶时间、要最高精度 | 有显卡、要离线、内容涉密 |
 
-### 1. 配置密钥
+> 全程只需要会两件事：**点 Fork**、**在终端里复制粘贴命令**。下面每一步都写了「怎么做」「成功长什么样」「失败了看哪」。
 
-**云端**：不要写进任何入库文件。
+### 0. 先准备三样东西（两种部署都要）
 
-- CNB：个人设置 → 云原生开发 → 个人环境变量（或密钥仓库 `imports`，见 `.cnb.yml` 末尾注释）
-- Docker：`docker run -e HF_TOKEN -e DEEPSEEK_API_KEY ...`，或用 `--env-file .env`
+| # | 东西 | 怎么拿 | 用途 |
+|---|---|---|---|
+| 1 | GitHub / CNB 账号 | 已有即可 | 存放代码 |
+| 2 | `HF_TOKEN` | ① 登录 <https://huggingface.co> → 右上头像 → Settings → Access Tokens → New token，类型选 **Read** → 复制 `hf_...`<br>② 再用**同一个账号**打开 <https://hf.co/pyannote/speaker-diarization-3.1>，把页面上的条款点 **Agree**（不点会 403） | 下载说话人分离模型 |
+| 3 | `DEEPSEEK_API_KEY` | 登录 <https://platform.deepseek.com> → 左侧 API keys → 创建 → 复制 `sk-...`（只显示一次） | 生成中文总结 |
 
-**Windows 本地**：
+> 这两个 token 是**密码级别**的东西：不要发群里、不要提交到仓库。云端怎么注入见 A2~A3，本地怎么放见 B7。
 
-```powershell
-copy .env.example .env      # 然后填入两个 token
-notepad .env
-```
+### 1. 名词小抄（看不懂就回来查）
 
-`app/config.py` 启动时读取**项目根目录**的 `.env`（UTF-8 编码，`override=False`——系统环境变量优先于 `.env`）。文件不存在也不报错，容器/云端无需此文件。
+| 名词 | 一句话 |
+|---|---|
+| 终端 / PowerShell | 敲命令的窗口。Windows：按 `Win` 键 → 输入 `powershell` → 回车 |
+| Fork（CNB 叫「派生」） | 把别人的仓库复制一份到**你自己的账号**下（你才有写权限） |
+| clone | 把网上的仓库下载到本地硬盘 |
+| 虚拟环境（venv） | 给这个项目单独一套 Python 依赖，不污染其他项目 |
+| 环境变量 | 程序启动时读的「外部开关」，本项目用它传 token |
+| `.env` | 项目根目录下的文本文件，把环境变量写进去，启动时自动读取（仅本地用） |
+| 端口 8000 | 本服务的 HTTP 端口；浏览器打开 `http://127.0.0.1:8000/docs` 就能操作接口 |
 
-### 2. 云端部署 A：cnb.cool 云原生开发（推荐）
+---
 
-> 面向「没有本地 GPU」或「想用 48GB 显存跑 `large-v3`」。
+## 部署 A 云端
 
-```bash
-git push            # 推到 CNB 仓库
-```
+> 目标：浏览器里点几下 + 终端里一行命令，得到一个可用的线上服务。**不需要在本地装任何软件。**
 
-在仓库页点「云原生开发」启动，`.cnb.yml` 已声明 GPU 节点：
+### A1. Fork 仓库
+
+1. 打开项目仓库页面（例如 `https://cnb.cool/<原作者>/polyglot-media-summarizer`）。
+2. 点右上角 **Fork**（CNB 上叫「派生」）。
+3. 归属选**你自己的账号**，仓库名保持默认 → 确认。
+4. 完成后你会得到 `https://cnb.cool/<你的账号>/polyglot-media-summarizer`。
+
+> 为什么必须 Fork：云原生开发的配额、密钥、流水线都挂在「你自己的仓库」上；直接在原仓库点启动，你配置的密钥不会生效。
+
+### A2. 建一个「密钥仓库」（只做一次）
+
+云端不方便往仓库里放 `.env`（会被提交入库），标准做法是把 token 放进一个**独立私有仓库**，再让主仓库引用它。
+
+1. 在 CNB 新建仓库，命名 `secret`（名字随意），可见性选 **私有**。
+2. 新建文件 `llm.yml`：
 
 ```yaml
-$:
-  vscode:
-    - runner:
-        tags: cnb:arch:amd64:gpu      # 16 核 / 48GB 显存
-      docker:
-        build: Dockerfile
+HF_TOKEN: hf_xxxxxxxxxxxxxxxxxxxx
+DEEPSEEK_API_KEY: sk-xxxxxxxxxxxxxxxxxxxx
 ```
 
-启动后会自动跑一次自检（`nvidia-smi` / `ffmpeg -version` / `import murmurai`），失败不阻塞开发环境。
+3. 提交。这个仓库**绝对不要设成公开**。
 
-服务跑在容器里，用 CNB 的「业务端口预览」打开 `8000` 即可访问（本机 `127.0.0.1` 在浏览器里不可达）：
+### A3. 把密钥注入开发环境（关键一步）
+
+1. 打开 <https://cnb.cool/profile/workspaces>（个人设置 → 云原生开发）。
+2. 找到 **个人环境变量**，按 YAML 数组填写：
+
+```yaml
+- imports: https://cnb.cool/<你的账号>/secret/-/blob/main/llm.yml
+  use_in_slugs:
+    - <你的账号>/polyglot-media-summarizer
+```
+
+3. 保存，然后**重启**开发环境才生效。
+
+三个必踩的坑：
+
+| 坑 | 后果 | 正确做法 |
+|---|---|---|
+| 漏写 `use_in_slugs` | 该项被忽略，静默不注入 | 写全 `<账号>/<仓库名>`，支持 glob |
+| `use_in_slugs` 没命中当前仓库 | 同上 | 组织名、仓库名大小写都要对 |
+| `imports` 写成外部地址 | 不加载 | 只支持 CNB 站内地址或相对路径 |
+
+> 兜底方案：进入开发环境后临时执行 `export HF_TOKEN=hf_xxx && export DEEPSEEK_API_KEY=sk-xxx`，但**环境重启就失效**，只适合临时试一下。
+
+### A4. 启动开发环境
+
+1. 打开你 Fork 出来的仓库，进入**任意分支页面**（不是设置页）。
+2. 点页面**右上角**的「云原生开发」。
+3. 选 **WebIDE**（浏览器直接打开，免安装）；想用本地编辑器可选 VS Code / Cursor。
+4. 首次启动会按 `Dockerfile` 构建镜像（CUDA + torch + ffmpeg），**约 10~20 分钟**；之后命中缓存，几十秒就绪。
+
+启动后会自动跑一次「环境自检」，终端里能看到 4 段输出，重点看这几行：
+
+```
+=== 1/4 GPU ===
+NVIDIA L40, 46068 MiB, 550.54.15            ← 有这行说明 GPU 正常
+=== 2/4 FFmpeg（路径解析与业务代码一致）===
+解析到的 ffmpeg  = /usr/bin/ffmpeg           ← 有具体路径说明 ffmpeg 可用
+=== 3/4 Python 依赖 ===
+torch 2.9.0+cu128 | cuda True | murmurai ok | fastapi 0.115.x
+=== 4/4 配置与数据目录 ===
+data_root = /workspace/data
+hf_token_present = True                      ← 必须是 True，否则回 A3 检查
+deepseek_key_present = True                  ← 同上
+```
+
+自检失败不会阻塞环境使用，但上面三行的值必须对。
+
+### A5. 启动服务
+
+在 WebIDE 的终端里（代码目录是 `/workspace`，与 `Dockerfile` 的 `WORKDIR` 一致）：
 
 ```bash
+cd /workspace
 python -m uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 
-### 3. 云端部署 B：Docker（Linux + NVIDIA Container Toolkit）
+- 必须监听 `0.0.0.0`，写 `127.0.0.1` 会导致云端端口预览打不开。
+- 看到 `Uvicorn running on http://0.0.0.0:8000` 即成功，**这个终端不要关**。
 
-> 面向自有 GPU 服务器，或团队想统一环境。**Windows 上也可以跑 Docker Desktop，但调试体验不如直接本地安装（见下一节）。**
+### A6. 从浏览器访问
+
+云端没有「本机 127.0.0.1」，要走 CNB 的端口映射，二选一：
+
+1. WebIDE 控制台的 **PORTS** 面板 → 添加端口 `8000` → 系统生成访问 URL。
+2. 或在终端执行：
 
 ```bash
+echo "$CNB_VSCODE_PROXY_URI" | sed "s/{{port}}/8000/"
+# 输出形如 https://xxxx-8000.cnb.run，浏览器打开它
+```
+
+在这个地址后面拼 `/docs`，就是可交互的接口文档（上传、查状态、下载都能点）。
+
+### A7. 数据与回收
+
+| 事项 | 说明 |
+|---|---|
+| 保活 | `.cnb.yml` 里 `keepAliveTimeout: 2h`，2 小时无 IDE/SSH 心跳会被回收 |
+| 文件 | 工作区 `/workspace` 在保留期内仍在，`data/outputs/*.md` 不会丢 |
+| 任务状态 | 存在**进程内存**，服务重启即清空（产物文件还在） |
+| 模型缓存 | `/workspace/.cache/huggingface`，保留期内不用重复下载 |
+| 时长上限 | GPU 节点单次最长 18 小时 |
+
+### A8. 云端排错
+
+| 现象 | 原因 | 处理 |
+|---|---|---|
+| 自检 `hf_token_present = False` | A3 没配对，或改完没重启环境 | 核对 `use_in_slugs` 后重启开发环境 |
+| 自检 `cuda False` | 没分到 GPU 节点 | 确认 `.cnb.yml` 里 `runner.tags: cnb:arch:amd64:gpu`；联系组织管理员开通 GPU 配额 |
+| 浏览器打不开 8000 | 服务监听了 `127.0.0.1`，或没加端口映射 | 用 `--host 0.0.0.0`，并在 PORTS 面板加 8000 |
+| Pyannote 报 403 | 没接受模型条款 | 回「0. 先准备三样东西」第 2 条 |
+| 首次启动卡在构建很久 | 要拉 6~8GB 基础镜像 | 正常现象，等它跑完；后续命中缓存 |
+
+### A9. 备选：自有服务器的 Docker
+
+有 GPU 服务器、或想让团队用同一套环境时走这条（可跳过 A1~A6）：
+
+```bash
+git clone https://cnb.cool/<你的账号>/polyglot-media-summarizer.git
+cd polyglot-media-summarizer
 docker build -t pms:dev .
-docker run --gpus all -it --rm \
-  -e HF_TOKEN -e DEEPSEEK_API_KEY \
+docker run --gpus all -d --name pms \
+  -e HF_TOKEN=hf_xxx -e DEEPSEEK_API_KEY=sk-xxx \
   -p 8000:8000 \
   -v "$PWD/data:/workspace/data" \
-  pms:dev bash
+  -v pms-models:/workspace/.cache \
+  pms:dev
+curl -s http://127.0.0.1:8000/healthz
 ```
 
-镜像约 6~8GB，首次启动会下载 `large-v3`（~3GB）与 pyannote 权重，落到 `HF_HOME`（容器内默认 `/workspace/.cache/huggingface`，已挂载到宿主 `./data` 之外的独立目录，建议再挂一个卷持久化）。
+前置条件：宿主机装好 NVIDIA 驱动与 [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html)，并确认下面这条能打印出显卡信息：
 
-### 4. 本地运行（Windows，RTX 4070 8G 示例）
-
-不依赖 Docker / WSL，直接用 Windows 上的 Python 跑。**8G 显存必须按下面的参数来，`large-v3` 会直接 OOM。**
-
-#### 4.1 安装 FFmpeg
-
-```powershell
-winget install Gyan.FFmpeg     # 装完重开终端
-ffmpeg -version                # 有版本输出即成功
+```bash
+docker run --rm --gpus all nvidia/cuda:12.8.0-base-ubuntu24.04 nvidia-smi
 ```
 
-装在非 PATH 目录也可以，在 `.env` 里写 `FFMPEG_BIN=C:/ffmpeg/bin/ffmpeg.exe`。代码的解析顺序是「环境变量 → PATH → winget / scoop / chocolatey 常见目录 → 报错」，不会依赖任何写死的路径。
+---
 
-#### 4.2 创建虚拟环境并安装依赖
+## 部署 B Windows 本地
+
+> 目标：从零在一台 Windows 电脑上跑起来。**按顺序做，每步都有验证命令，过了再下一步。**
+
+### B0. 准备清单
+
+| 项 | 要求 | 怎么确认 |
+|---|---|---|
+| 系统 | Windows 10 / 11 64 位 | `winver` |
+| 显卡 | NVIDIA，显存 ≥ 6GB（RTX 4070 8G 够用） | `nvidia-smi` |
+| 驱动 | 支持 CUDA 12.8（`nvidia-smi` 右上角 `CUDA Version` ≥ 12.8） | 低于 12.8 先去官网升级驱动 |
+| 磁盘 | ≥ 15GB 空闲（torch 约 3GB + 模型 3~6GB + 数据） | 资源管理器 |
+| 软件 | Git、Python 3.12、FFmpeg | 见 B1~B3 |
+
+> 全程用 **PowerShell**（不是 cmd）：按 `Win` 键 → 输入 `powershell` → 回车。
+> 装完任何软件都要**关掉再重开** PowerShell，否则 PATH 不生效。
+
+### B1. 安装 Git
 
 ```powershell
-py -3.12 --version             # 需要 3.10 ~ 3.13（murmurai-core 不支持 3.14）
+winget install --id Git.Git -e --source winget
+git --version
+```
+
+- 成功标志：`git version 2.x.x`
+- 没有 `winget`：去 <https://git-scm.com/download/win> 下载安装包，一路 Next 即可。
+
+### B2. 安装 Python 3.12
+
+```powershell
+winget install --id Python.Python.3.12 -e --source winget
+py -3.12 --version
+```
+
+- 成功标志：`Python 3.12.x`
+- 用官网安装包时，**第一页必须勾选 `Add python.exe to PATH`**，否则后面所有 `python` 命令都找不到。
+- 不要装 Microsoft Store 版（路径特殊，虚拟环境容易出问题）。
+- 版本范围是 `3.10 ~ 3.13`，**不要用 3.14**（`murmurai-core` 不支持）。
+
+### B3. 安装 FFmpeg
+
+```powershell
+winget install --id Gyan.FFmpeg -e --source winget
+ffmpeg -version
+```
+
+- 成功标志：第一行 `ffmpeg version 7.x`
+- 装了但仍提示「不是内部或外部命令」：重开 PowerShell；还不行就手动下载 <https://www.gyan.dev/ffmpeg/builds/> 的 `release-essentials` 压缩包，解压到 `C:\ffmpeg`，然后二选一：
+  - 把 `C:\ffmpeg\bin` 加进系统 PATH；
+  - 或者稍后在 `.env` 里写 `FFMPEG_BIN=C:/ffmpeg/bin/ffmpeg.exe`（更省事，改配置即可）。
+
+### B4. 把仓库克隆到本地
+
+```powershell
+cd $HOME\Documents
+git clone https://cnb.cool/<你的账号>/polyglot-media-summarizer.git
+cd polyglot-media-summarizer
+dir
+```
+
+- 成功标志：`dir` 能看到 `Dockerfile`、`requirements.txt`、`app`。
+- 私有仓库会提示输入账号密码：CNB 用访问令牌，GitHub 用 Personal Access Token。
+- 小技巧：在文件资源管理器进入该文件夹，地址栏输入 `powershell` 回车，终端就直接开在这个目录。
+
+### B5. 创建虚拟环境并安装依赖
+
+```powershell
 py -3.12 -m venv .venv
-.\.venv\Scripts\Activate.ps1   # 若提示执行策略错误：Set-ExecutionPolicy -Scope Process Bypass
-
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
 pip install -r requirements.txt
-
-# CUDA 版 torch 必须单独装：requirements.txt 里刻意不写，避免云端把镜像自带的 CUDA 版覆盖成 CPU 版
-pip install torch==2.9.0 torchaudio==2.9.0 --index-url https://download.pytorch.org/whl/cu128
-
-python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
-# 期望输出：2.9.0+cu128 True
-# 若是 False，说明装成了 CPU 版，重跑上面那条 pip install
 ```
 
-#### 4.3 处理 cuDNN 9 DLL（`faster-whisper` 的隐藏坑）
+激活时报「禁止运行脚本」就执行：
 
-ctranslate2 找不到 cuDNN 9 的 DLL 时会**静默退回 CPU**（日志里看起来一切正常，只是慢十倍）：
+```powershell
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+.\.venv\Scripts\Activate.ps1
+```
+
+激活成功的标志：命令行前面出现 `(.venv)`。
+
+接着装 **CUDA 版 torch** —— `requirements.txt` 里刻意没写它（云端靠镜像提供），本地必须自己装：
+
+```powershell
+pip install torch==2.9.0 torchaudio==2.9.0 --index-url https://download.pytorch.org/whl/cu128
+python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
+```
+
+- 成功标志：`2.9.0+cu128 True`
+- 若是 `2.9.0+cpu False`：装成 CPU 版了，重跑上面那条（别用默认源）。
+
+### B6. 让 ctranslate2 找到 cuDNN 9
+
+`torch.cuda.is_available()` 为 True **只说明 PyTorch 能用 GPU**；转录走的是 ctranslate2，它需要单独能找到 cuDNN 9 的 DLL，否则**静默退回 CPU**（不报错，只是慢十倍）。
+
+先判断要不要做这一步：
+
+```powershell
+python -c "import ctranslate2; print('cuda devices:', ctranslate2.get_cuda_device_count())"
+```
+
+- 输出 `>= 1`：已有可用 cuDNN，**直接跳到 B7**。
+- 输出 `0`：按下表三选一。
+
+| 方案 | 做法 | 说明 |
+|---|---|---|
+| **A. pip 安装（推荐）** | 见下方命令 | 随虚拟环境一起删除，干净 |
+| B. 复用 PyTorch 自带 DLL | 先 `dir .\.venv\Lib\site-packages\torch\lib\cudnn_*.dll` 确认有文件，再把该目录加进 PATH | 免下载；目录里 DLL 多，可能与其他 CUDA 组件互相干扰 |
+| C. 系统级安装 | 从 NVIDIA 官网下 cuDNN 9，解压后把 `bin` 加进 PATH | 多项目共用，需自己管版本 |
+
+方案 A 的完整命令：
 
 ```powershell
 pip install "nvidia-cudnn-cu12==9.*"
+
 $cudnn = "$PWD\.venv\Lib\site-packages\nvidia\cudnn\bin"
-$env:PATH = "$cudnn;$env:PATH"        # 仅当前会话生效
+$env:PATH = "$cudnn;$env:PATH"        # 仅当前 PowerShell 窗口有效
+
+# 想永久生效（写入用户级 PATH）：
+[Environment]::SetEnvironmentVariable(
+  "PATH", "$cudnn;" + [Environment]::GetEnvironmentVariable("PATH", "User"), "User")
 ```
 
-#### 4.4 配置 `.env`
+验证（两条都要过）：
+
+```powershell
+python -c "import ctypes; ctypes.WinDLL('cudnn_ops64_9.dll'); print('cudnn 9 DLL 可加载')"
+python -c "import ctranslate2; print('cuda devices:', ctranslate2.get_cuda_device_count())"
+```
+
+### B7. 填写 `.env`
 
 ```powershell
 copy .env.example .env
 notepad .env
 ```
 
-必须填的只有两个：`HF_TOKEN`、`DEEPSEEK_API_KEY`。8G 显存相关的建议值：
-
-| 变量 | 取值 | 原因 |
+| 变量 | 填什么 | 说明 |
 |---|---|---|
-| `ASR_MODEL` | `medium` | `large-v3` fp16 约需 10GB+；`medium` 约 5GB |
-| `ASR_COMPUTE_TYPE` | `int8_float16` | 权重 8bit，显存再降约一半，中英混说精度损失很小 |
-| `ASR_BATCH_SIZE` | `4` | 服务端遇 OOM 会自动减半重试，但别一开始就 16 |
+| `HF_TOKEN` | `hf_...` | 必填 |
+| `DEEPSEEK_API_KEY` | `sk-...` | 必填 |
+| `ASR_MODEL` | `medium` | 8G 显存必须降档，`large-v3` 会 OOM |
+| `ASR_COMPUTE_TYPE` | `int8_float16` | 进一步省显存 |
+| `ASR_BATCH_SIZE` | `4` | 别一上来就 16 |
 | `CHUNK_MINUTES` | `10` | 单片更短，峰值显存更低 |
-| `DATA_ROOT` | `data` | **相对路径按项目根解析**，不要写 `C:\...` 绝对路径 |
+| `DATA_ROOT` | `data` | 相对路径按项目根解析，别写 `C:\...` |
 
-> ⚠️ Windows 上**不要**设 `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`，该选项不受支持（`.cnb.yml` / `Dockerfile` 里那份是给 Linux 容器的）。
+- 12GB 以上显存可以不改这几项，保留 `large-v3` + `float16` + `16`。
+- 记事本保存即可（`app/config.py` 按 UTF-8 读取）。
+- 路径类配置三种写法都支持：`D:/data`、`%USERPROFILE%/data`、`data`（相对项目根）。
 
-#### 4.5 启动与自检
+### B8. 启动服务
 
 ```powershell
 python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
 ```
 
-另开一个 PowerShell 验证：
+- 成功标志：`Uvicorn running on http://127.0.0.1:8000`
+- 启动日志会打印 `data_root` 与 `hf_token_present`，顺手核对路径与密钥。
+- 首次转录会下载模型（`medium` 约 1.5GB + pyannote 权重），默认存 `%USERPROFILE%\.cache\huggingface`；想换盘就在 `.env` 里设绝对路径 `HF_HOME=D:/models/huggingface`。
+- **不要加 `--workers`**：任务状态在进程内存里。
+
+### B9. 验证
+
+浏览器打开 <http://127.0.0.1:8000/docs>，这是自动生成的接口文档：
+
+1. 展开 `POST /upload` → **Try it out** → 选一个 mp4/mkv → **Execute**；
+2. 复制返回的 `task_id`；
+3. 展开 `GET /status/{task_id}` → 粘贴 id → Execute，反复点到 `status` 变成 `completed`；
+4. 浏览器打开 `http://127.0.0.1:8000/result/<task_id>` 下载 Markdown。
+
+命令行等价写法：
 
 ```powershell
 curl.exe -s http://127.0.0.1:8000/healthz
-# {"status":"ok","ffmpeg":true,"ffprobe":true,
-#  "config":{"data_root":"D:\\code\\polyglot-media-summarizer\\data",
-#            "hf_token_present":true,"deepseek_key_present":true, ...}}
-
-# 先单独验证音频链路（不需要模型，秒级返回，确认 ffmpeg 与中文路径没问题）
-python -m app.services.audio .\sample.mp4 --chunk-minutes 0.2
+curl.exe -s -X POST http://127.0.0.1:8000/upload -F "file=@.\sample.mp4"
+curl.exe -s http://127.0.0.1:8000/status/<task_id>
 ```
 
-首次转录会下载 `medium`（~1.5GB）、对齐模型与 pyannote 权重，默认落在 `%USERPROFILE%\.cache\huggingface`；想换盘就在 `.env` 里设绝对路径 `HF_HOME=D:/models/huggingface`。
+> PowerShell 里的 `curl` 是 `Invoke-WebRequest` 的别名，不支持 `-F`，必须写 `curl.exe`。
 
-> - 用 `curl.exe` 而不是 `curl`：PowerShell 里 `curl` 是 `Invoke-WebRequest` 的别名，不支持 `-F`。
-> - 不要加 `--workers`：任务状态存在进程内存里。
+### B10. 关闭与下次启动
 
-### 5. 启动服务（云端 / 本地通用）
+- 关闭：在运行服务的窗口按 `Ctrl + C`。
+- 下次启动（三步）：
 
-```bash
-# 云端容器（CNB / Docker）
-uvicorn app.main:app --host 0.0.0.0 --port 8000
-
-# Windows 本地（只给本机用，别监听 0.0.0.0）
+```powershell
+cd $HOME\Documents\polyglot-media-summarizer
+.\.venv\Scripts\Activate.ps1
 python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
-
-# 开发时可加 --reload
 ```
 
-自检：
+### B11. 本地排错
 
-```bash
-curl -s http://127.0.0.1:8000/healthz | python -m json.tool
-# {"status":"ok","ffmpeg":true,"ffprobe":true,
-#  "config":{"hf_token_present":true,"deepseek_key_present":true, ...}}
+| 现象 | 原因 | 解决 |
+|---|---|---|
+| `无法加载文件 Activate.ps1，因为在此系统上禁止运行脚本` | PowerShell 执行策略限制 | `Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass` |
+| `python` / `py` 不是内部或外部命令 | 没勾 Add to PATH，或没重开终端 | 重装 Python 并勾选 PATH，或重开 PowerShell |
+| `torch.cuda.is_available()` 是 False | 装成了 CPU 版 | 按 B5 重装 cu128 版 |
+| `ct2 cuda devices: 0` | 缺 cuDNN 9 DLL | 按 B6 处理 |
+| 转录极慢、任务管理器里 GPU 占用接近 0 | 同上，已静默退回 CPU | 同上 |
+| `未找到可执行文件 'ffmpeg'` | 没进 PATH | 按 B3 设 `FFMPEG_BIN` |
+| `OSError: [WinError 1455] 页面文件太小` | 虚拟内存不足（torch + 模型同时加载） | 系统属性 → 高级 → 性能设置 → 高级 → 虚拟内存，调到 16GB 以上 |
+| 启动报 `[Errno 10048]` 端口占用 | 8000 被别的程序占了 | 换 `--port 8001` |
+| 日志中文乱码 | 控制台代码页不是 UTF-8 | 先执行 `chcp 65001` |
+| `CUDA out of memory` | 参数超出显存 | 依次降：`ASR_BATCH_SIZE=2` → `ASR_MODEL=small` → `ENABLE_DIARIZATION=false` |
+
+### B12. 一键脚本（可选，省去手敲命令）
+
+仓库自带两个 PowerShell 脚本，把 B5/B6 的验证与启动步骤打包好了：
+
+| 脚本 | 作用 | 用法 |
+|---|---|---|
+| `scripts\check-env.ps1` | 8 项自检：Python 版本 / 依赖 / torch-CUDA / cuDNN / FFmpeg / 密钥 / 数据目录 / 显存与模型档位是否匹配 | `powershell -ExecutionPolicy Bypass -File .\scripts\check-env.ps1` |
+| `scripts\start-local.ps1` | 定位 `.venv` → 检查端口 → 启动 uvicorn → 自动打开 `/docs` | `.\scripts\start-local.ps1` |
+
+常用参数：
+
+```powershell
+.\scripts\start-local.ps1 -Port 8001              # 换端口
+.\scripts\start-local.ps1 -Reload                 # 开发模式，改代码自动重载
+.\scripts\start-local.ps1 -NoBrowser              # 不自动开浏览器
+.\scripts\start-local.ps1 -Setup                  # 首次使用：自动建 .venv 并装依赖（会下载数 GB）
+.\scripts\start-local.ps1 -BindAddress 0.0.0.0    # 局域网访问（本项目无鉴权，谨慎）
 ```
 
-> ⚠️ 任务状态存在进程内存里，**只能单 worker 运行**。不要加 `--workers 4`。
+自检输出示例（绿色即通过，红色会给出修复提示）：
 
-### 6. 跑通第一次任务
+```
+==== Polyglot Media Summarizer · 环境自检 ====
+项目目录: D:\code\polyglot-media-summarizer
+
+1/8 Python 解释器
+  [OK]   使用虚拟环境: D:\code\polyglot-media-summarizer\.venv\Scripts\python.exe
+4/8 PyTorch 与 CUDA
+  [OK]   torch 2.9.0+cu128 · CUDA 可用 · NVIDIA GeForce RTX 4070 · 8.0GB 显存
+5/8 cuDNN 9（ctranslate2）
+  [OK]   ctranslate2 检测到 1 个 CUDA 设备（cuDNN 9 已就绪）
+8/8 配置与数据目录
+  [OK]   ASR: model=medium compute=int8_float16 batch=4 chunk=10.0min
+
+全部通过（警告 0 项）。
+下一步：powershell -ExecutionPolicy Bypass -File .\scripts\start-local.ps1
+```
+
+> - 需要 PowerShell 5.1+（Windows 10/11 自带）；脚本保存为 **UTF-8 with BOM**，避免 5.1 下中文乱码。
+> - 若系统禁止执行脚本，用 `powershell -ExecutionPolicy Bypass -File .\scripts\xxx.ps1` 绕过，不必改全局策略。
+> - `check-env.ps1` 有任何 `[FAIL]` 都会以退出码 1 结束，可直接接进 CI 或快捷方式。
+
+---
+
+## 第一次使用
+
+不管用哪种部署，用起来完全一样。流程是：上传 → 排队 → 抽取音频 → 说话人分离 → 转录 → 总结 → 下载。
+
+### 用浏览器（推荐新手）
+
+1. 打开 `http://127.0.0.1:8000/docs`（云端换成你的端口预览地址 + `/docs`）。
+2. `POST /upload` → Try it out → 选择文件 → Execute → 记下 `task_id`。
+3. `GET /status/{task_id}` → 反复 Execute，看 `progress` 从 15 涨到 100。
+4. `GET /result/{task_id}` → Execute → 点「Download file」拿到 Markdown。
+
+### 用命令行
 
 ```bash
-# 1) 上传（立即返回 202）
 curl -s -X POST http://127.0.0.1:8000/upload -F "file=@./sample.mp4"
-# {"task_id":"3b5e2934...","status":"queued","status_url":"/status/3b5e2934...","result_url":"/result/3b5e2934..."}
+# {"task_id":"3b5e...","status":"queued","status_url":"/status/3b5e...","result_url":"/result/3b5e..."}
 
-# 2) 轮询状态
-curl -s http://127.0.0.1:8000/status/3b5e2934...
+curl -s http://127.0.0.1:8000/status/3b5e...
 # {"status":"transcribing","stage":"语音转录","progress":57.3,"detail":"转录切片 3/7", ...}
 
-# 3) 下载总结
-curl -OJ http://127.0.0.1:8000/result/3b5e2934...
+curl -OJ http://127.0.0.1:8000/result/3b5e...
 ```
 
-> Windows 下把 `curl` 换成 `curl.exe`，下载那步可改用 `curl.exe -o summary.md http://127.0.0.1:8000/result/<task_id>`。
+### 结果在哪
+
+```
+data/outputs/{task_id}.md                 ← 最终中文总结（你要的东西）
+data/outputs/{task_id}.transcript.json    ← 转录原文，可人工校对
+data/uploads/{task_id}.mp4                ← 原始上传文件
+```
+
+### 要等多久
+
+见 [性能与显存](#性能与显存)。粗估：10 分钟内容在 48GB 云端约 3 分钟，在 8G 本地约 5 分钟。
 
 ---
 
@@ -506,44 +785,6 @@ python -m app.services.summarizer ./demo.json --out ./summary.md
 <summary><b>CUDA out of memory</b></summary>
 
 服务端已内置「OOM 自动减半 `batch_size`，最多重试 2 次」。仍失败时按顺序降级：`ASR_BATCH_SIZE` → `CHUNK_MINUTES` → `ASR_MODEL`（8G 卡请直接用 `medium` + `int8_float16`）。也可临时 `ENABLE_DIARIZATION=false` 只跑转录，省掉 pyannote 的约 2GB。
-</details>
-
-<details>
-<summary><b>Windows：<code>torch.cuda.is_available()</code> 返回 False</b></summary>
-
-装成了 CPU 版 torch。重装 CUDA 版：
-
-```powershell
-pip uninstall -y torch torchaudio
-pip install torch==2.9.0 torchaudio==2.9.0 --index-url https://download.pytorch.org/whl/cu128
-```
-
-另外确认显卡驱动支持 CUDA 12.8（`nvidia-smi` 右上角的 `CUDA Version` ≥ 12.8）。
-</details>
-
-<details>
-<summary><b>Windows：转录极慢、GPU 占用接近 0</b></summary>
-
-ctranslate2 找不到 cuDNN 9 的 DLL，静默退回 CPU 了。装 `nvidia-cudnn-cu12==9.*`，并把 `.venv\Lib\site-packages\nvidia\cudnn\bin` 加进 `PATH`（详见[4.3](#43-处理-cudnn-9-dllfaster-whisper-的隐藏坑)）。
-</details>
-
-<details>
-<summary><b>Windows：提示找不到 ffmpeg</b></summary>
-
-`ffmpeg -version` 能跑但服务找不到，通常是安装后没重开终端（PATH 没刷新）。也可以在 `.env` 里直接指定：
-
-```dotenv
-FFMPEG_BIN=C:/ffmpeg/bin/ffmpeg.exe
-FFPROBE_BIN=C:/ffmpeg/bin/ffprobe.exe
-```
-
-代码会按「环境变量 → PATH → winget/scoop/chocolatey 常见目录」依次探测，失败时的报错信息里可直接看到该配哪个变量。
-</details>
-
-<details>
-<summary><b>Windows：日志里的中文变成乱码</b></summary>
-
-控制台代码页不是 UTF-8。启动前执行 `chcp 65001`，或在「终端设置」里把编码改成 UTF-8。这不影响接口返回的 JSON（始终 UTF-8）。
 </details>
 
 <details>
