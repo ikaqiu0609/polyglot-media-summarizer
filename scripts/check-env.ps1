@@ -328,7 +328,7 @@ if ($smi) {
 Write-Host ""
 if ($script:fail -eq 0) {
     Write-Host "全部通过（警告 $($script:warn) 项）。" -ForegroundColor Green
-    Write-Host "下一步：powershell -ExecutionPolicy Bypass -File .\scripts\start-local.ps1" -ForegroundColor Green
+    Write-Host "下一步：scripts\start-local.bat（cmd / 双击；PowerShell 里用 .\scripts\start-local.ps1）" -ForegroundColor Green
     exit 0
 } else {
     Write-Host "失败 $($script:fail) 项、警告 $($script:warn) 项，请按上面的 [FAIL] 提示修复后再启动。" -ForegroundColor Red

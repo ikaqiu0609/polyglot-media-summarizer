@@ -85,12 +85,15 @@ if (-not (Test-Path $python)) {
     if (-not $Setup) {
         Write-Host "[FAIL] 未找到虚拟环境（已查找 .venv / venv）" -ForegroundColor Red
         Write-Host "       请先按 README B5 执行：" -ForegroundColor DarkGray
-        Write-Host "         py -0p                        :: 看装了哪些 Python（要 3.10~3.13）" -ForegroundColor DarkGray
-        Write-Host "         py -3.13 -m venv .venv        :: 把 3.13 换成你实际有的版本" -ForegroundColor DarkGray
-        Write-Host "         .\.venv\Scripts\Activate.ps1" -ForegroundColor DarkGray
+        Write-Host "         rem 看装了哪些 Python（要 3.10~3.13）" -ForegroundColor DarkGray
+        Write-Host "         py -0p" -ForegroundColor DarkGray
+        Write-Host "         rem 把 3.13 换成你实际有的版本" -ForegroundColor DarkGray
+        Write-Host "         py -3.13 -m venv .venv" -ForegroundColor DarkGray
+        Write-Host "         rem cmd 激活（PowerShell 里用 .\.venv\Scripts\Activate.ps1）" -ForegroundColor DarkGray
+        Write-Host "         .venv\Scripts\activate.bat" -ForegroundColor DarkGray
         Write-Host "         pip install torch==2.9.0 torchaudio==2.9.0 --index-url https://download.pytorch.org/whl/cu128" -ForegroundColor DarkGray
         Write-Host "         pip install -r requirements.txt" -ForegroundColor DarkGray
-        Write-Host "       或让本脚本自动准备（会下载数 GB）：.\scripts\start-local.ps1 -Setup" -ForegroundColor DarkGray
+        Write-Host "       或让本脚本自动准备（会下载数 GB）：scripts\start-local.bat -Setup" -ForegroundColor DarkGray
         exit 1
     }
 
@@ -160,7 +163,7 @@ function Test-PortFree {
 
 if (-not (Test-PortFree -p $Port)) {
     Write-Host "[FAIL] 端口 $Port 已被占用" -ForegroundColor Red
-    Write-Host "       换端口：.\scripts\start-local.ps1 -Port 8001" -ForegroundColor DarkGray
+    Write-Host "       换端口：scripts\start-local.bat -Port 8001" -ForegroundColor DarkGray
     Write-Host "       查占用：Get-NetTCPConnection -LocalPort $Port | Select-Object OwningProcess" -ForegroundColor DarkGray
     exit 1
 }

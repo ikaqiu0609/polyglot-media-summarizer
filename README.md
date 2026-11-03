@@ -91,8 +91,10 @@
 │       ├── transcribe.py        # 转录 + 说话人分离 + 边界合并
 │       └── summarizer.py        # DeepSeek 两阶段总结
 ├── scripts/
-│   ├── check-env.ps1            # Windows 环境自检（B5/B6 的验证步骤打包）
-│   └── start-local.ps1          # Windows 一键启动（venv + 端口检查 + 开浏览器）
+│   ├── check-env.bat            # 【cmd / 双击入口】环境自检，转调 check-env.ps1
+│   ├── start-local.bat          # 【cmd / 双击入口】一键启动，转调 start-local.ps1
+│   ├── check-env.ps1            # 自检的实际逻辑（B5/B6 的验证步骤打包）
+│   └── start-local.ps1          # 启动的实际逻辑（venv + 端口检查 + 开浏览器）
 └── data/                        # 运行时生成（已 gitignore）
     ├── uploads/                 # 原始上传文件
     ├── audio/                   # 16k wav / 切片（任务结束自动清理）
@@ -130,7 +132,7 @@
 
 | 名词 | 一句话 |
 |---|---|
-| 终端 / PowerShell | 敲命令的窗口。Windows：按 `Win` 键 → 输入 `powershell` → 回车 |
+| 终端 / CMD | 敲命令的窗口。Windows：按 `Win` 键 → 输入 `cmd` → 回车。本文默认 CMD（大多数 Windows 用户的默认终端）；必须用 PowerShell 的地方会单独标注 |
 | Fork（CNB 叫「派生」） | 把别人的仓库复制一份到**你自己的账号**下（你才有写权限） |
 | clone | 把网上的仓库下载到本地硬盘 |
 | 虚拟环境（venv） | 给这个项目单独一套 Python 依赖，不污染其他项目 |
@@ -305,12 +307,14 @@ docker run --rm --gpus all nvidia/cuda:12.8.0-base-ubuntu24.04 nvidia-smi
 | 磁盘 | ≥ 15GB 空闲（torch 约 3GB + 模型 3~6GB + 数据） | 资源管理器 |
 | 软件 | Git、Python（3.10~3.13，**不要 3.14**）、FFmpeg | 见 B1~B3 |
 
-> 全程用 **PowerShell**（不是 cmd）：按 `Win` 键 → 输入 `powershell` → 回车。
-> 装完任何软件都要**关掉再重开** PowerShell，否则 PATH 不生效。
+> 全程用 **CMD（命令提示符）**：按 `Win` 键 → 输入 `cmd` → 回车。
+> 装完任何软件都要**关掉再重开**窗口，否则 PATH 不生效。
+>
+> ⚠️ **别在 cmd 里敲 `.ps1`**：cmd 不认识 `.ps1`，会弹出「选择一个应用以打开此 .ps1 文件」。记住对应关系：**cmd 用 `activate.bat` / `scripts\*.bat`，PowerShell 才用 `Activate.ps1` / `scripts\*.ps1`**。下面所有命令都是 cmd 版，直接复制粘贴即可。
 
 ### B1. 安装 Git
 
-```powershell
+```bat
 winget install --id Git.Git -e --source winget
 git --version
 ```
@@ -322,7 +326,7 @@ git --version
 
 先看机器上已经有什么，**有 3.10~3.13 就不用再装**：
 
-```powershell
+```bat
 py -0p
 ```
 
@@ -334,9 +338,11 @@ py -0p
 - `*` 表示 `py` 的**默认**版本。上面这种情况默认是 3.14，**不能用来建虚拟环境**，后面必须显式写 `py -3.13`。
 - 只有 3.14 或没有可用版本时：
 
-```powershell
+```bat
 winget install --id Python.Python.3.12 -e --source winget
-py -0p                      # 重新确认，装完可能需要新开终端
+
+rem 重新确认，装完可能需要新开终端
+py -0p
 ```
 
 - 成功标志：`py -0p` 里出现 `-V:3.12` 或 `-V:3.13`。
@@ -346,20 +352,20 @@ py -0p                      # 重新确认，装完可能需要新开终端
 
 ### B3. 安装 FFmpeg
 
-```powershell
+```bat
 winget install --id Gyan.FFmpeg -e --source winget
 ffmpeg -version
 ```
 
 - 成功标志：第一行 `ffmpeg version 7.x`
-- 装了但仍提示「不是内部或外部命令」：重开 PowerShell；还不行就手动下载 <https://www.gyan.dev/ffmpeg/builds/> 的 `release-essentials` 压缩包，解压到 `C:\ffmpeg`，然后二选一：
+- 装了但仍提示「不是内部或外部命令」：重开窗口（PATH 才会刷新）；还不行就手动下载 <https://www.gyan.dev/ffmpeg/builds/> 的 `release-essentials` 压缩包，解压到 `C:\ffmpeg`，然后二选一：
   - 把 `C:\ffmpeg\bin` 加进系统 PATH；
   - 或者稍后在 `.env` 里写 `FFMPEG_BIN=C:/ffmpeg/bin/ffmpeg.exe`（更省事，改配置即可）。
 
 ### B4. 把仓库克隆到本地
 
-```powershell
-cd $HOME\Documents
+```bat
+cd /d "%USERPROFILE%\Documents"
 git clone https://cnb.cool/<你的账号>/polyglot-media-summarizer.git
 cd polyglot-media-summarizer
 dir
@@ -367,31 +373,43 @@ dir
 
 - 成功标志：`dir` 能看到 `Dockerfile`、`requirements.txt`、`app`。
 - 私有仓库会提示输入账号密码：CNB 用访问令牌，GitHub 用 Personal Access Token。
-- 小技巧：在文件资源管理器进入该文件夹，地址栏输入 `powershell` 回车，终端就直接开在这个目录。
+- 小技巧：在文件资源管理器进入该文件夹，地址栏输入 `cmd` 回车，终端就直接开在这个目录。
 
 ### B5. 创建虚拟环境并安装依赖
 
-```powershell
-py -3.13 -m venv .venv        # 3.13 换成 B2 里 py -0p 看到的版本（3.10~3.13）
-.\.venv\Scripts\Activate.ps1
-python -V                     # 必须显示所选版本，且提示符前出现 (.venv)
+```bat
+rem 下面这条的 3.13 换成 B2 里 py -0p 看到的版本（3.10 ~ 3.13）
+py -3.13 -m venv .venv
+
+rem cmd 激活脚本是 activate.bat —— 敲 .ps1 会弹「选择一个应用以打开此 .ps1 文件」
+.venv\Scripts\activate.bat
+
+rem 必须显示所选版本，且提示符前出现 (.venv)
+python -V
 
 python -m pip install --upgrade pip
 
-# ① 先装 CUDA 版 torch
+rem ① 先装 CUDA 版 torch（顺序不能反，原因见下）
 pip install torch==2.9.0 torchaudio==2.9.0 --index-url https://download.pytorch.org/whl/cu128
 python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available())"
 
-# ② 再装项目依赖
+rem ② 再装项目依赖
 pip install -r requirements.txt
 pip check
 ```
 
-激活时报「禁止运行脚本」就执行：
+激活时报「禁止运行脚本」——这只会在 **PowerShell** 里出现（cmd 用的是 `activate.bat`，不受执行策略影响）。真要用 PowerShell 就执行：
 
 ```powershell
 Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 .\.venv\Scripts\Activate.ps1
+```
+
+或者干脆**不激活**：直接指定虚拟环境里的解释器，效果等价，也不会踩任何终端策略：
+
+```bat
+.venv\Scripts\python.exe -m pip install --upgrade pip
+.venv\Scripts\python.exe -m uvicorn app.main:app --host 127.0.0.1 --port 8000
 ```
 
 **为什么 torch 必须放在 requirements 前面？**
@@ -403,7 +421,7 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 - 成功标志：`2.9.0+cu128 12.8 True`
 - 若是 `2.9.0+cpu None False`：装成 CPU 版了，重跑 ① 那条（别用默认源）。
 - 若提示 `torchvision ... requires torch>=2.14.0`：**本项目不使用 torchvision**，执行 `pip uninstall -y torchvision` 即可，不影响任何功能。
-- 若提示 `UnicodeDecodeError: 'gbk' codec can't decode byte ...`：`requirements.txt` 被保存成了「中文注释 + 无 BOM」，pip 24.x 会按 GBK 解码。仓库里的版本已改为纯 ASCII，不会出现；若你自己加过中文注释，改用 `$env:PYTHONUTF8="1"` 再装，或把文件另存为「UTF-8 with BOM」。
+- 若提示 `UnicodeDecodeError: 'gbk' codec can't decode byte ...`：`requirements.txt` 被保存成了「中文注释 + 无 BOM」，pip 24.x 会按 GBK 解码。仓库里的版本已改为纯 ASCII，不会出现；若你自己加过中文注释，先 `set PYTHONUTF8=1`（PowerShell 里是 `$env:PYTHONUTF8="1"`）再装，或把文件另存为「UTF-8 with BOM」。
 
 ### B6. 让 ctranslate2 找到 cuDNN 9
 
@@ -411,7 +429,7 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 
 先判断要不要做这一步：
 
-```powershell
+```bat
 python -c "import ctranslate2; print('cuda devices:', ctranslate2.get_cuda_device_count())"
 ```
 
@@ -426,27 +444,33 @@ python -c "import ctranslate2; print('cuda devices:', ctranslate2.get_cuda_devic
 
 方案 A 的完整命令：
 
-```powershell
+```bat
 pip install "nvidia-cudnn-cu12==9.*"
 
-$cudnn = "$PWD\.venv\Lib\site-packages\nvidia\cudnn\bin"
-$env:PATH = "$cudnn;$env:PATH"        # 仅当前 PowerShell 窗口有效
+rem 仅当前 cmd 窗口有效（在项目根目录执行，%CD% 就是项目根）
+set "PATH=%CD%\.venv\Lib\site-packages\nvidia\cudnn\bin;%PATH%"
 
-# 想永久生效（写入用户级 PATH）：
-[Environment]::SetEnvironmentVariable(
-  "PATH", "$cudnn;" + [Environment]::GetEnvironmentVariable("PATH", "User"), "User")
+rem 想永久生效：用下面这条打开「环境变量」界面，
+rem 在「用户变量」里选中 Path → 编辑 → 新建 → 粘贴绝对路径：
+rem     D:\你的路径\polyglot-media-summarizer\.venv\Lib\site-packages\nvidia\cudnn\bin
+rundll32 sysdm.cpl,EditEnvironmentVariables
+
+rem 不要用 setx 改 PATH：超过 1024 字符会被截断，还会把系统变量抄进用户变量
 ```
+
+> PowerShell 等价写法：`$env:PATH = "$PWD\.venv\Lib\site-packages\nvidia\cudnn\bin;$env:PATH"`。
+> `set` / `$env:` 都只影响**当前窗口**，关掉就失效——所以之后启动服务的那个窗口要先执行过一次，或者直接用上面的「永久生效」方式。
 
 验证（两条都要过）：
 
-```powershell
+```bat
 python -c "import ctypes; ctypes.WinDLL('cudnn_ops64_9.dll'); print('cudnn 9 DLL 可加载')"
 python -c "import ctranslate2; print('cuda devices:', ctranslate2.get_cuda_device_count())"
 ```
 
 ### B7. 填写 `.env`
 
-```powershell
+```bat
 copy .env.example .env
 notepad .env
 ```
@@ -467,7 +491,7 @@ notepad .env
 
 ### B8. 启动服务
 
-```powershell
+```bat
 python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
 ```
 
@@ -487,22 +511,22 @@ python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
 
 命令行等价写法：
 
-```powershell
+```bat
 curl.exe -s http://127.0.0.1:8000/healthz
 curl.exe -s -X POST http://127.0.0.1:8000/upload -F "file=@.\sample.mp4"
 curl.exe -s http://127.0.0.1:8000/status/<task_id>
 ```
 
-> PowerShell 里的 `curl` 是 `Invoke-WebRequest` 的别名，不支持 `-F`，必须写 `curl.exe`。
+> CMD 里没有这个坑（`curl` 就是 `curl.exe`）；**PowerShell** 里 `curl` 是 `Invoke-WebRequest` 的别名、不支持 `-F`。所以上面统一写 `curl.exe`，两种终端都能跑。
 
 ### B10. 关闭与下次启动
 
 - 关闭：在运行服务的窗口按 `Ctrl + C`。
 - 下次启动（三步）：
 
-```powershell
-cd $HOME\Documents\polyglot-media-summarizer
-.\.venv\Scripts\Activate.ps1
+```bat
+cd /d "%USERPROFILE%\Documents\polyglot-media-summarizer"
+.venv\Scripts\activate.bat
 python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
 ```
 
@@ -510,10 +534,11 @@ python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
 
 | 现象 | 原因 | 解决 |
 |---|---|---|
-| `无法加载文件 Activate.ps1，因为在此系统上禁止运行脚本` | PowerShell 执行策略限制 | `Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass` |
-| `python` / `py` 不是内部或外部命令 | 没勾 Add to PATH，或没重开终端 | 重装 Python 并勾选 PATH，或重开 PowerShell |
+| 敲 `Activate.ps1` 弹出「选择一个应用以打开此 .ps1 文件」 | 在 **cmd** 里执行了 PowerShell 脚本，cmd 不认识 `.ps1` | 改用 `.venv\Scripts\activate.bat`；或换到 PowerShell 窗口再执行 `Activate.ps1` |
+| `无法加载文件 Activate.ps1，因为在此系统上禁止运行脚本` | PowerShell 执行策略限制（只在 PowerShell 里出现，cmd 不受影响） | `Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass`，或直接用 `activate.bat` |
+| `python` / `py` 不是内部或外部命令 | 没勾 Add to PATH，或没重开终端 | 重装 Python 并勾选 PATH，或重开窗口 |
 | `No suitable Python runtime found`（`py -3.12` 时） | 机器上没装 3.12；`py` 只挑已装版本，不会自动下载 | `py -0p` 看实际版本，然后用 `py -3.13 -m venv .venv`；确实没有 3.10~3.13 再 `winget install --id Python.Python.3.12 -e` |
-| `pip` 报 `UnicodeDecodeError: 'gbk' codec can't decode byte ...` | pip 24.x 在中文 Windows 上按 cp936 解 `requirements.txt`，文件却是无 BOM 的 UTF-8 | 临时：`$env:PYTHONUTF8="1"` 后重试；永久：文件存成纯 ASCII 或 UTF-8 with BOM（仓库版本已修正） |
+| `pip` 报 `UnicodeDecodeError: 'gbk' codec can't decode byte ...` | pip 24.x 在中文 Windows 上按 cp936 解 `requirements.txt`，文件却是无 BOM 的 UTF-8 | 临时：`set PYTHONUTF8=1`（PowerShell 里 `$env:PYTHONUTF8="1"`）后重试；永久：文件存成纯 ASCII 或 UTF-8 with BOM（仓库版本已修正） |
 | `pip` 报 `torchvision ... requires torch>=x.y` | 旧环境遗留的 torchvision 与被降级/换版的 torch 不配套 | 本项目不用它：`pip uninstall -y torchvision`，再 `pip check` |
 | `torch.cuda.is_available()` 是 False | 装成了 CPU 版 | 按 B5 重装 cu128 版 |
 | `ct2 cuda devices: 0` | 缺 cuDNN 9 DLL | 按 B6 处理 |
@@ -526,21 +551,35 @@ python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
 
 ### B12. 一键脚本（可选，省去手敲命令）
 
-仓库自带两个 PowerShell 脚本，把 B5/B6 的验证与启动步骤打包好了：
+仓库自带两组脚本，把 B5/B6 的验证与启动步骤打包好了。**cmd 用 `.bat`，PowerShell 用 `.ps1`**，功能完全一样：
 
-| 脚本 | 作用 | 用法 |
-|---|---|---|
-| `scripts\check-env.ps1` | 8 项自检：Python 版本 / 依赖 / torch-CUDA / cuDNN / FFmpeg / 密钥 / 数据目录 / 显存与模型档位是否匹配 | `powershell -ExecutionPolicy Bypass -File .\scripts\check-env.ps1` |
-| `scripts\start-local.ps1` | 定位虚拟环境（自动识别 `.venv` / `venv`）→ 检查端口 → 启动 uvicorn → 自动打开 `/docs` | `.\scripts\start-local.ps1` |
+| 脚本 | 作用 | cmd 用法 | PowerShell 用法 |
+|---|---|---|---|
+| `check-env` | 8 项自检：Python 版本 / 依赖 / torch-CUDA / cuDNN / FFmpeg / 密钥 / 数据目录 / 显存与模型档位是否匹配 | `scripts\check-env.bat` | `.\scripts\check-env.ps1` |
+| `start-local` | 定位虚拟环境（自动识别 `.venv` / `venv`）→ 检查端口 → 启动 uvicorn → 自动打开 `/docs` | `scripts\start-local.bat` | `.\scripts\start-local.ps1` |
+
+> `.bat` 只是外壳（负责绕过执行策略后再调用同名 `.ps1`），**逻辑只写在 `.ps1` 里**，要改行为请改 `.ps1`。
+> 两个 `.bat` 都能在资源管理器里**双击运行**；`check-env.bat` 结束时窗口会停住，方便看结果。
 
 常用参数：
 
-```powershell
-.\scripts\start-local.ps1 -Port 8001              # 换端口
-.\scripts\start-local.ps1 -Reload                 # 开发模式，改代码自动重载
-.\scripts\start-local.ps1 -NoBrowser              # 不自动开浏览器
-.\scripts\start-local.ps1 -Setup                  # 首次使用：自动挑 3.10~3.13 建 .venv、装 torch + 依赖（会下载数 GB）
-.\scripts\start-local.ps1 -BindAddress 0.0.0.0    # 局域网访问（本项目无鉴权，谨慎）
+```bat
+rem 参数与 PowerShell 版完全一致，只是入口换成 .bat
+
+rem 换端口
+scripts\start-local.bat -Port 8001
+
+rem 开发模式，改代码自动重载
+scripts\start-local.bat -Reload
+
+rem 不自动开浏览器
+scripts\start-local.bat -NoBrowser
+
+rem 首次使用：自动挑 3.10~3.13 建 .venv、装 torch + 依赖（会下载数 GB）
+scripts\start-local.bat -Setup
+
+rem 局域网访问（本项目无鉴权，谨慎）
+scripts\start-local.bat -BindAddress 0.0.0.0
 ```
 
 自检输出示例（绿色即通过，红色会给出修复提示）：
@@ -559,12 +598,13 @@ python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
   [OK]   ASR: model=medium compute=int8_float16 batch=4 chunk=10.0min
 
 全部通过（警告 0 项）。
-下一步：powershell -ExecutionPolicy Bypass -File .\scripts\start-local.ps1
+下一步：scripts\start-local.bat（cmd / 双击；PowerShell 里用 .\scripts\start-local.ps1）
 ```
 
-> - 需要 PowerShell 5.1+（Windows 10/11 自带）；脚本保存为 **UTF-8 with BOM**，避免 5.1 下中文乱码。
-> - 若系统禁止执行脚本，用 `powershell -ExecutionPolicy Bypass -File .\scripts\xxx.ps1` 绕过，不必改全局策略。
-> - `check-env.ps1` 有任何 `[FAIL]` 都会以退出码 1 结束，可直接接进 CI 或快捷方式。
+> - 需要 PowerShell 5.1+（Windows 10/11 自带）；`.ps1` 保存为 **UTF-8 with BOM**，避免 5.1 下中文乱码。
+> - `.bat` 已内置 `-ExecutionPolicy Bypass`，**cmd 用户不需要改任何策略**，直接跑或双击即可。
+> - 若在 PowerShell 里直接跑 `.ps1` 被策略拦住，用 `powershell -ExecutionPolicy Bypass -File .\scripts\xxx.ps1` 绕过，不必改全局策略。
+> - `check-env.bat` / `check-env.ps1` 有任何 `[FAIL]` 都会以退出码 1 结束；接进 CI 请直接调 `.ps1`（`.bat` 末尾有 `pause`，会等按键）。
 
 ---
 
@@ -707,7 +747,7 @@ python -m app.services.summarizer ./demo.json --out ./summary.md
 ```
 
 > 密钥不用 `export`：云端已由平台注入，本地写进 `.env` 即可（`app/config.py` 会自动加载）。
-> **Windows** 下把 `./sample.mp4` 换成 `.\sample.mp4`；需要临时设变量时用 `$env:HF_TOKEN="hf_xxx"`。
+> **Windows** 下把 `./sample.mp4` 换成 `.\sample.mp4`；需要临时设变量时，cmd 用 `set HF_TOKEN=hf_xxx`，PowerShell 用 `$env:HF_TOKEN="hf_xxx"`。
 
 输出示例：
 
