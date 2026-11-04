@@ -1,7 +1,9 @@
 # Polyglot Media Summarizer
 
-> 上传一段多语言视频/音频，得到一份带时间戳与说话人归属的中文结构化总结。
+> 上传一段多语言视频/音频，先得到一份带时间戳与说话人归属的**本地转录 JSON**，确认后再生成中文结构化总结。
 > **ASR 全程本地推理**——跑在云端 GPU 容器里，或你自己的 Windows/Linux 机器上；音频不出本地，只有「提炼后的文本」会送给 DeepSeek。
+
+**默认是两段式，不会自动花钱**：转录（本地 GPU，免费）→ `transcribed` 暂停 → 你显式调用 `/summarize` → DeepSeek 总结（付费）。详见 [两段式流程](#两段式流程转录免费总结付费)。
 
 支持 `.mp4 / .mkv / .mov / .webm / .mp3 / .wav / .m4a / .flac ...`，以英文为主、夹杂韩语/日语的音视频内容效果最佳。
 
@@ -12,6 +14,8 @@
 - [核心特性](#核心特性)
 - [架构](#架构)
 - [目录结构](#目录结构)
+- [模型授权（必读）](#模型授权必读)
+- [两段式流程（转录免费，总结付费）](#两段式流程转录免费总结付费)
 - [部署总览](#部署总览)
 - [部署 A 云端](#部署-a-云端)
 - [部署 B Windows 本地](#部署-b-windows-本地)
@@ -33,11 +37,12 @@
 | 能力 | 实现 | 说明 |
 |---|---|---|
 | 音频抽取 | FFmpeg | 任意容器 → 16kHz / 单声道 / PCM16 WAV，`-c:a copy` 切片不重编码 |
-| 语音识别 | `murmurai-core`（WhisperX fork）+ `faster-whisper` | 默认 `large-v3`，支持 `large-v3-turbo`；词级时间戳 |
+| 语音识别 | `murmurai-core`（WhisperX fork）+ `faster-whisper` | 默认 `large-v3`，支持 `large-v3-turbo`；词级时间戳按需启用 |
 | 说话人分离 | `pyannote.audio` + `pyannote/speaker-diarization-3.1` | 整段只跑一次，跨切片说话人标签一致 |
 | 长音频处理 | FFmpeg 按时长切片 + Silero VAD | 超过 15 分钟自动切分，规避显存溢出 |
 | 边界拼接 | 词级拆段 + 字符级重叠去重 | 切片切点造成的半句/重复词自动修复 |
 | 结构化总结 | DeepSeek（OpenAI SDK 兼容） | 分段摘要 → 全局聚合，输出六段式中文 Markdown |
+| **费用控制** | **两段式（转录 / 总结解耦）** | **转录免费且本地完成，JSON 落盘后停在 `transcribed`；只有显式调用 `/summarize` 才产生 API 费用** |
 | 服务化 | FastAPI + BackgroundTasks | 上传即返回 `task_id`，轮询进度 |
 | 运行环境 | 云原生（CNB / Docker）与本地（Windows）双路径 | 云端 `cnb:arch:amd64:gpu`（16 核 / 48GB）；本地 8GB 显卡可用（`medium` + `int8_float16`） |
 | 配置方式 | 环境变量 + `.env` | 云端由平台注入；本地用项目根目录的 `.env`（`python-dotenv`） |
@@ -55,23 +60,34 @@
                                         │
                     ┌───────────────────▼────────────────────────────┐
                     │ ① audio.py     FFmpeg 16k mono + 按时长切片     │
-                    │                → [AudioChunk(start_sec, ...)]  │
                     ├────────────────────────────────────────────────┤
-                    │ ② transcribe.py                                │
-                    │    pyannote 3.1 整段分离 → 全局 speaker 时间片  │
-                    │    murmurai 逐片转录 → 对齐 → 词级拆段          │
-                    │    时间戳加回全局偏移 → 边界合并去重            │
-                    │    → [{start, end, speaker, text}]             │
-                    ├────────────────────────────────────────────────┤
-                    │ ③ summarizer.py                                │
+                    │ ② transcribe.py       （本地 GPU，不花钱）      │
+                    │    pyannote 整段分离 → murmurai 逐片转录        │
+                    │    → 全局时间戳 → 边界合并去重                  │
+                    └───────────────────┬────────────────────────────┘
+                                        │
+                     data/outputs/{task_id}.transcript.json
+                                        │
+                         ┌──────────────▼──────────────┐
+                         │ status = transcribed（暂停）│
+                         │ 不调用 DeepSeek，不产生费用 │
+                         └──────────────┬──────────────┘
+                                        │ 你显式确认（二选一）
+                    ┌───────────────────┴────────────────────┐
+                    │ POST /summarize/{task_id}              │
+                    │ POST /summarize（上传 transcript.json） │
+                    └───────────────────┬────────────────────┘
+                                        │
+                    ┌───────────────────▼────────────────────────────┐
+                    │ ③ summarizer.py      （DeepSeek，按 token 计费）│
                     │    Map：按字数分块 → JSON 局部摘要（校验时间戳）│
                     │    Reduce：片段索引 → 六段式中文 Markdown       │
                     └───────────────────┬────────────────────────────┘
                                         │
-                     data/outputs/{task_id}.md  +  .transcript.json
+                             data/outputs/{task_id}.md
 ```
 
-**为什么分两段？** ASR 只负责「听清 + 分清谁在说」，产出机器可校验的 JSON；语言理解交给 DeepSeek。好处是音频可以彻底本地化，也便于人工校对转录原文。
+**为什么分两段？** ASR 只负责「听清 + 分清谁在说」，产出机器可校验的 JSON；语言理解交给 DeepSeek。更重要的是**成本边界**：转录用你自己的 GPU，边际成本为零；DeepSeek 按 token 计费。把两者拆开，就能先白嫖转录、人工校对 JSON，确认值得再花钱总结。`AUTO_SUMMARIZE=true` 可恢复「转录完立即总结」的旧行为。
 
 ---
 
@@ -104,6 +120,88 @@
 
 ---
 
+## 模型授权（必读）
+
+> 这一段决定「说话人分离能不能用」。不点 Agree，日志里会反复出现 403，所有段落都会变成 `UNKNOWN`。
+
+### 0. 三个必须 Agree 的 gated 模型
+
+用**同一个** HuggingFace 账号依次打开、登录、点 **Agree and access repository**：
+
+| # | 模型页 | 作用 | 不点会怎样 |
+|---|---|---|---|
+| 1 | <https://hf.co/pyannote/speaker-diarization-3.1> | 说话人分离主管线（默认 `DIARIZATION_MODEL`） | 403，整份结果无说话人标签 |
+| 2 | <https://hf.co/pyannote/segmentation-3.0> | 3.1 使用的分割模型 | 403，同上 |
+| 3 | <https://hf.co/pyannote/speaker-diarization-community-1> | `pyannote.audio` 4.x 会额外请求它的 PLDA 文件（`plda/xvec_transform.npz`） | 403，同上（**最容易漏**） |
+
+然后到 <https://hf.co/settings/tokens> 创建 **Read** 权限的 token（`hf_...`），填进 `.env` 的 `HF_TOKEN`。
+
+三个常见坑：
+
+- 三个页面必须用**同一个账号**点 Agree，token 也必须是这个账号的；
+- 点完 Agree 后**重启服务**：进程内会缓存「分离不可用」状态，避免每个任务都重新下载权重再失败；
+- 企业/组织账号可能需要管理员审批，`403 ... not in the authorized list` 通常就是这个原因。
+
+> 日志里出现 `Cannot access gated repo for url ...` 时，直接看 URL 里的仓库名，回上表确认是否漏点。
+
+### 1. 不需要 Agree、但会自动下载的模型
+
+| 模型 | 何时下载 | 大小 |
+|---|---|---|
+| `Systran/faster-whisper-<ASR_MODEL>` | 首次转录 | medium ≈ 1.5GB，large-v3 ≈ 3GB |
+| `snakers4/silero-vad` | 首次转录（`VAD_METHOD=silero`） | 约 2MB |
+| `jonatasgrosman/wav2vec2-large-xlsr-53-chinese-zh-cn` | 中文内容且 `ASR_ALIGN` 生效 | 约 1.2GB |
+| `kresnik/wav2vec2-large-xlsr-korean` | 韩语内容且 `ASR_ALIGN` 生效 | 约 1.2GB |
+| `pyannote/*` 权重 | 首次说话人分离 | 数十 MB |
+
+> `ASR_ALIGN=auto`（默认）只在说话人分离成功时才加载对齐模型。分离失败时对齐结果不会被使用，跳过它能省下这 1.2GB 下载和几分钟等待。
+
+---
+
+## 两段式流程（转录免费，总结付费）
+
+默认 `AUTO_SUMMARIZE=false`。完整流程：
+
+```text
+POST /upload
+   → extracting → transcribing → transcribed（停住）
+   → data/outputs/{task_id}.transcript.json 已落盘
+   → 到这里为止 0 API 费用；只想要转录文本可以直接结束
+   → 需要总结时，二选一：
+       POST /summarize/{task_id}          复用该任务的转录
+       POST /summarize  -F file=@x.json   导入别的机器产出的 JSON
+   → summarizing → completed
+   → data/outputs/{task_id}.md
+```
+
+| 场景 | 推荐操作 |
+|---|---|
+| 只想要转录文本 / 字幕 | 停在 `transcribed`，直接读 `.transcript.json`，不花钱 |
+| 确认内容值得总结 | `POST /summarize/{task_id}` |
+| 换机器、或复用历史转录 | `POST /summarize` 上传 JSON |
+| 想让服务全自动 | `.env` 里设 `AUTO_SUMMARIZE=true` |
+| 总结失败（402 / 网络） | 修复后再次 `POST /summarize/{task_id}`，不会重新转录 |
+
+命令行示例（Windows cmd）：
+
+```bat
+rem 1) 上传，记下 task_id
+curl.exe -s -X POST http://127.0.0.1:8000/upload -F "file=@.\sample.mp4"
+
+rem 2) 等 status 变成 transcribed
+curl.exe -s http://127.0.0.1:8000/status/<task_id>
+
+rem 3) 确认要花钱了，再触发总结
+curl.exe -s -X POST http://127.0.0.1:8000/summarize/<task_id>
+
+rem 或者：导入一个现成的 transcript.json
+curl.exe -s -X POST http://127.0.0.1:8000/summarize -F "file=@.\demo.transcript.json"
+```
+
+> `POST /summarize/{task_id}` 只允许在 `transcribed` 或 `failed`（且 JSON 还在）时调用：`queued/extracting/transcribing` 返回 409，`completed` 且 `.md` 已存在也返回 409，避免误触发重复计费。
+
+---
+
 ## 部署总览
 
 两条路，二选一，**代码完全一样**，区别只在「在哪台机器上跑」。
@@ -124,8 +222,8 @@
 | # | 东西 | 怎么拿 | 用途 |
 |---|---|---|---|
 | 1 | GitHub / CNB 账号 | 已有即可 | 存放代码 |
-| 2 | `HF_TOKEN` | ① 登录 <https://huggingface.co> → 右上头像 → Settings → Access Tokens → New token，类型选 **Read** → 复制 `hf_...`<br>② 再用**同一个账号**打开 <https://hf.co/pyannote/speaker-diarization-3.1>，把页面上的条款点 **Agree**（不点会 403） | 下载说话人分离模型 |
-| 3 | `DEEPSEEK_API_KEY` | 登录 <https://platform.deepseek.com> → 左侧 API keys → 创建 → 复制 `sk-...`（只显示一次） | 生成中文总结 |
+| 2 | `HF_TOKEN` | ① 登录 <https://huggingface.co> → 右上头像 → Settings → Access Tokens → New token，类型选 **Read** → 复制 `hf_...`<br>② 用**同一个账号**给 [3 个 gated 模型](#0-三个必须-agree-的-gated-模型) 逐个点 **Agree**（缺一个就会 403） | 下载说话人分离模型 |
+| 3 | `DEEPSEEK_API_KEY` | 登录 <https://platform.deepseek.com> → 左侧 API keys → 创建 → 复制 `sk-...`（只显示一次） | 生成中文总结（**只用转录功能可以不填**） |
 
 > 这两个 token 是**密码级别**的东西：不要发群里、不要提交到仓库。云端怎么注入见 A2~A3，本地怎么放见 B7。
 
@@ -260,7 +358,7 @@ echo "$CNB_VSCODE_PROXY_URI" | sed "s/{{port}}/8000/"
 | 自检 `hf_token_present = False` | A3 没配对，或改完没重启环境 | 核对 `use_in_slugs` 后重启开发环境 |
 | 自检 `cuda False` | 没分到 GPU 节点 | 确认 `.cnb.yml` 里 `runner.tags: cnb:arch:amd64:gpu`；联系组织管理员开通 GPU 配额 |
 | 浏览器打不开 8000 | 服务监听了 `127.0.0.1`，或没加端口映射 | 用 `--host 0.0.0.0`，并在 PORTS 面板加 8000 |
-| Pyannote 报 403 | 没接受模型条款 | 回「0. 先准备三样东西」第 2 条 |
+| Pyannote 报 403 | 没接受模型条款（常见是漏了 `speaker-diarization-community-1`） | 回 [模型授权（必读）](#模型授权必读)，三个模型都要点 Agree |
 | 首次启动卡在构建很久 | 要拉 6~8GB 基础镜像 + 装 torch 系依赖 | 正常现象，等它跑完；后续命中缓存 |
 | 构建报 `COPY ... failed to calculate checksum ...: "/requirements.txt": not found` | `.cnb.yml` 里 `build:` 写成了字符串，CNB 的构建上下文因此只有 Dockerfile 自己 | 改成对象写法：`build: { dockerfile: Dockerfile, by: [requirements.txt] }`；Dockerfile 里 COPY 了哪些文件，`by` 就要列全哪些 |
 | 打开 IDE 没有 CodeBuddy / 插件全没了、终端只剩 bash | 镜像里装了 code-server → 走「单容器模式」，顶掉了 CNB 默认环境（`cnbcool/default-dev-env` 里预装 CodeBuddy 等） | 在 Dockerfile 里 `code-server --install-extension tencent-cloud.coding-copilot`（本仓库已内置）；或删掉镜像里的 code-server 回到双容器模式 |
@@ -480,11 +578,13 @@ notepad .env
 
 | 变量 | 填什么 | 说明 |
 |---|---|---|
-| `HF_TOKEN` | `hf_...` | 必填 |
-| `DEEPSEEK_API_KEY` | `sk-...` | 必填 |
+| `HF_TOKEN` | `hf_...` | 必填；需为 [3 个 gated 模型](#0-三个必须-agree-的-gated-模型) 点过 Agree 的账号 |
+| `DEEPSEEK_API_KEY` | `sk-...` | 必填（只有手动触发总结时才会用到） |
+| `AUTO_SUMMARIZE` | `false` | 保持 false：转录完先停下，确认后再花钱 |
 | `ASR_MODEL` | `medium` | 8G 显存必须降档，`large-v3` 会 OOM |
 | `ASR_COMPUTE_TYPE` | `int8_float16` | 进一步省显存 |
 | `ASR_BATCH_SIZE` | `4` | 别一上来就 16 |
+| `ASR_ALIGN` | `auto` | 分离失败时跳过词级对齐，省约 1.2GB 下载 |
 | `CHUNK_MINUTES` | `10` | 单片更短，峰值显存更低 |
 | `DATA_ROOT` | `data` | 相对路径按项目根解析，别写 `C:\...` |
 
@@ -571,6 +671,8 @@ python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
 | 启动报 `[Errno 10048]` 端口占用 | 8000 被别的程序占了 | 换 `--port 8001` |
 | 日志中文乱码 | 控制台代码页不是 UTF-8 | 先执行 `chcp 65001` |
 | `CUDA out of memory` | 参数超出显存 | 依次降：`ASR_BATCH_SIZE=2` → `ASR_MODEL=small` → `ENABLE_DIARIZATION=false` |
+| 状态一直停在 `transcribed`，没有 `.md` | 默认两段式：转录完成后等你确认，避免自动计费 | 要总结就 `POST /summarize/{task_id}`；想全自动设 `AUTO_SUMMARIZE=true` 并重启 |
+| 日志出现 `No active speech found in audio` | 该切片是静音/纯音乐，VAD 没检测到语音 | 正常，跳过该片；若每片都是这行，检查文件是否真的没有音轨或音量过低 |
 
 ### B12. 一键脚本（可选，省去手敲命令）
 
@@ -634,38 +736,46 @@ scripts\start-local.bat -BindAddress 0.0.0.0
 
 ## 第一次使用
 
-不管用哪种部署，用起来完全一样。流程是：上传 → 排队 → 抽取音频 → 说话人分离 → 转录 → 总结 → 下载。
+不管用哪种部署，用起来完全一样。流程是：上传 → 抽取音频 → 说话人分离 → 转录 → **停在 `transcribed`** → 你确认 → 总结 → 下载。
 
 ### 用浏览器（推荐新手）
 
 1. 打开 `http://127.0.0.1:8000/docs`（云端换成你的端口预览地址 + `/docs`）。
 2. `POST /upload` → Try it out → 选择文件 → Execute → 记下 `task_id`。
-3. `GET /status/{task_id}` → 反复 Execute，看 `progress` 从 15 涨到 100。
-4. `GET /result/{task_id}` → Execute → 点「Download file」拿到 Markdown。
+3. `GET /status/{task_id}` → 反复 Execute，直到 `status` 变成 **`transcribed`**（`progress` 约 75）。
+4. 此时 `data/outputs/{task_id}.transcript.json` 已经生成，**没有产生任何 API 费用**。
+5. 确认要总结后，执行 `POST /summarize/{task_id}` → Execute → 看 `status` 变成 `completed`。
+6. `GET /result/{task_id}` → Execute → 点「Download file」拿到 Markdown。
 
 ### 用命令行
 
 ```bash
+# 1) 上传
 curl -s -X POST http://127.0.0.1:8000/upload -F "file=@./sample.mp4"
 # {"task_id":"3b5e...","status":"queued","status_url":"/status/3b5e...","result_url":"/result/3b5e..."}
 
+# 2) 轮询到 transcribed —— 此时只有 JSON，没有花一分钱
 curl -s http://127.0.0.1:8000/status/3b5e...
-# {"status":"transcribing","stage":"语音转录","progress":57.3,"detail":"转录切片 3/7", ...}
+# {"status":"transcribed","stage":"转录完成（待总结）","progress":75.0,"detail":"转录完成，等待手动触发总结...", ...}
 
+# 3) 确认内容值得总结，再触发（会调用 DeepSeek）
+curl -s -X POST http://127.0.0.1:8000/summarize/3b5e...
+
+# 4) 下载
 curl -OJ http://127.0.0.1:8000/result/3b5e...
 ```
 
 ### 结果在哪
 
 ```
-data/outputs/{task_id}.md                 ← 最终中文总结（你要的东西）
-data/outputs/{task_id}.transcript.json    ← 转录原文，可人工校对
+data/outputs/{task_id}.transcript.json    ← 转录原文（停在这一步也完全可用）
+data/outputs/{task_id}.md                 ← 总结（触发 /summarize 后才生成）
 data/uploads/{task_id}.mp4                ← 原始上传文件
 ```
 
 ### 要等多久
 
-见 [性能与显存](#性能与显存)。粗估：10 分钟内容在 48GB 云端约 3 分钟，在 8G 本地约 5 分钟。
+见 [性能与显存](#性能与显存)。粗估：10 分钟内容在 48GB 云端约 3 分钟、在 8G 本地约 5 分钟——这是**转录**耗时。总结另算（几秒到几十秒），而且默认要你手动触发才会执行。
 
 ---
 
@@ -685,11 +795,34 @@ data/uploads/{task_id}.mp4                ← 原始上传文件
 
 错误：`415` 不支持的扩展名、`413` 超过 `MAX_UPLOAD_MB`、`400` 空文件。
 
+> 上传只负责「抽取 + 转录」。默认流程会停在 `transcribed`，**不会自动调用付费 API**。
+
+### `POST /summarize/{task_id}`
+
+对已完成转录的任务触发总结。**会调用 DeepSeek API 并产生费用。**
+
+响应码 `202`，字段含 `task_id`、`status`、`transcript_path`、`status_url`、`result_url`、`note`。
+
+| 场景 | 响应 |
+|---|---|
+| `transcribed` 或 `failed`（且 JSON 存在） | `202`，开始总结（GPU 忙时排队） |
+| `queued` / `extracting` / `diarizing` / `transcribing` | `409` 任务尚未转录完成 |
+| `summarizing` | `409` 正在总结，勿重复触发 |
+| `completed` 且 `.md` 已存在 | `409` 总结已存在（避免重复计费） |
+
+### `POST /summarize`
+
+导入现成的 `transcript.json` 并总结，适合换机器或复用历史转录。`multipart/form-data`，字段名 `file`，上限 50MB。
+
+接受两种结构：完整转录对象（含 `segments` / `speakers` / `duration_sec` / `diarized`），或直接的 segment 数组。缺 `segments`、文本全空、时间戳无法解析时返回 `400`。
+
+响应 `202`，返回新的 `task_id`，后续用 `/status`、`/result` 跟踪。
+
 ### `GET /status/{task_id}`
 
 | 字段 | 说明 |
 |---|---|
-| `status` | `queued / extracting / diarizing / transcribing / summarizing / completed / failed` |
+| `status` | `queued / extracting / diarizing / transcribing / transcribed / summarizing / completed / failed` |
 | `stage` | 中文阶段名，如「说话人分离」 |
 | `progress` | 0~100，一位小数 |
 | `detail` | 当前细节，如「转录切片 3/7」 |
@@ -702,11 +835,11 @@ data/uploads/{task_id}.mp4                ← 原始上传文件
 ### `GET /result/{task_id}`
 
 返回 `text/markdown; charset=utf-8`，`Content-Disposition: attachment; filename="summary-{task_id}.md"`。
-错误：`404` 不存在、`409` 未完成、`410` 产物已被保留期清理。
+错误：`404` 不存在、`409` 未完成（`transcribed` 会明确提示先调用 `/summarize/{task_id}`）、`410` 产物已被保留期清理。
 
 ### `GET /healthz`
 
-`ffmpeg`/`ffprobe` 是否可用、脱敏后的配置快照、内存中任务数。**不返回任何密钥。**
+`ffmpeg`/`ffprobe` 是否可用、脱敏后的配置快照、内存中任务数、等待总结的任务数（`pending_summary`）。**不返回任何密钥。**
 
 ---
 
@@ -716,13 +849,16 @@ data/uploads/{task_id}.mp4                ← 原始上传文件
 |---|---|---|
 | `queued` | 0% | 已入队，等待 GPU（`MAX_CONCURRENT_TASKS` 串行） |
 | `extracting` | 2 → 15% | `audio.analyze()` 抽取 + 切片 |
-| `diarizing` | 15 → 35% | 加载 pyannote + 整段说话人分离 |
-| `transcribing` | 35 → 75% | 逐片转录 + 对齐 + 说话人指派 |
-| `summarizing` | 75 → 98% | DeepSeek Map → Reduce |
+| `diarizing` | 15 → 35% | 加载 pyannote + 整段说话人分离（失败会降级，不阻断） |
+| `transcribing` | 35 → 75% | 逐片转录 + 说话人指派 |
+| **`transcribed`** | **75%** | **转录完成、JSON 已落盘，等待你决定是否花钱总结（默认停留点）** |
+| `summarizing` | 75 → 98% | 收到 `/summarize` 后调用 DeepSeek Map → Reduce |
 | `completed` | 100% | Markdown 已落盘 |
-| `failed` | 停在失败点 | `error` 字段带具体原因 |
+| `failed` | 停在失败点 | `error` 字段带具体原因；若 JSON 还在，`result.retry_url` 可直接重跑总结 |
 
-状态**不可回退**：进入 `completed`/`failed` 后，迟到的进度回调会被忽略。
+状态**不可回退**：进入 `completed`/`failed` 后，迟到的进度回调会被忽略；`transcribed` 也会忽略转录阶段的迟到回调，只能通过 `/summarize` 向前推进。
+
+> `transcribed` 不是失败，也不是完成。`/result` 此时返回 409，但 `.transcript.json` 已经可以正常使用。
 
 ---
 
@@ -732,9 +868,11 @@ data/uploads/{task_id}.mp4                ← 原始上传文件
 data/
 ├── uploads/   {task_id}.mp4                       # 原始上传，默认保留（便于重跑/排查）
 ├── audio/     {task_id}/xxx.16k.wav  + .partNNN.wav   # 任务结束自动删除
-└── outputs/   {task_id}.transcript.json           # 转录原文（可直接人工校对）
-               {task_id}.md                       # 最终中文总结
+└── outputs/   {task_id}.transcript.json           # 转录原文（transcribed 时就有，可直接人工校对）
+               {task_id}.md                       # 中文总结（只有 /summarize 成功后才有）
 ```
+
+`transcript.json` 就是「免费阶段」的完整产物，也可以直接拿去喂给 `POST /summarize` 或命令行工具。
 
 转录 JSON 结构（也可直接喂给 `summarizer` 单独重跑）：
 
@@ -770,6 +908,8 @@ python -m app.services.transcribe ./sample.mp4 --out ./demo.json
 python -m app.services.summarizer ./demo.json --out ./summary.md
 ```
 
+> `④` 与 `POST /summarize` 等价：都只读转录 JSON，不会再跑一遍 ASR，也不消耗 GPU 时间。
+
 > 密钥不用 `export`：云端已由平台注入，本地写进 `.env` 即可（`app/config.py` 会自动加载）。
 > **Windows** 下把 `./sample.mp4` 换成 `.\sample.mp4`；需要临时设变量时，cmd 用 `set HF_TOKEN=hf_xxx`，PowerShell 用 `$env:HF_TOKEN="hf_xxx"`。
 
@@ -792,8 +932,8 @@ python -m app.services.summarizer ./demo.json --out ./summary.md
 
 | 变量 | 说明 |
 |---|---|
-| `HF_TOKEN` | Hugging Face Token，用于加载 pyannote（也接受 `HUGGINGFACE_TOKEN` / `HF_HUB_TOKEN`） |
-| `DEEPSEEK_API_KEY` | DeepSeek API Key；缺失时任务会在 `summarizing` 阶段失败 |
+| `HF_TOKEN` | Hugging Face Token，用于加载 pyannote（也接受 `HUGGINGFACE_TOKEN` / `HF_HUB_TOKEN`）；需为 [3 个 gated 模型](#0-三个必须-agree-的-gated-模型) 点过 Agree |
+| `DEEPSEEK_API_KEY` | DeepSeek API Key；**只在需要总结时必填**，缺失时 `/summarize` 会失败（转录不受影响） |
 
 ### 服务与文件
 
@@ -817,17 +957,20 @@ python -m app.services.summarizer ./demo.json --out ./summary.md
 | `ASR_COMPUTE_TYPE` | `float16` | CPU 下自动降级 `int8` |
 | `ASR_BATCH_SIZE` | `16` | OOM 时自动减半重试，最多 2 次 |
 | `VAD_METHOD` | `silero` | 免额外许可；`pyannote` 需接受 `segmentation-3.0` 条款 |
-| `ASR_ALIGN` | `1` | 词级对齐开关，关闭可省一次模型下载 |
-| `DIARIZATION_MODEL` | `pyannote/speaker-diarization-3.1` | 保持 3.1 |
+| `ASR_ALIGN` | `auto` | `auto`=仅分离成功时对齐；`1`=强制；`0`=关闭。分离失败时对齐结果不会被使用，`auto` 可省约 1.2GB 下载 |
+| `ASR_LANG_VOTE_SAMPLES` | `3` | 前 N 个「有语音」切片投票决定全局语言，之后固定传参，避免同一文件语言漂移 |
+| `DIARIZATION_MODEL` | `pyannote/speaker-diarization-3.1` | 保持 3.1；需 Agree 的模型见 [模型授权](#模型授权必读) |
 | `ENABLE_DIARIZATION` | `true` | 关掉则只转录不打说话人标签（可省 HF_TOKEN） |
 | `DIAR_MIN_SPEAKERS` / `DIAR_MAX_SPEAKERS` | 空 | 已知人数时设置，显著提升准确率 |
 | `CHUNK_MINUTES` | `15` | 单文件最长时长，超过即切片 |
 | `MERGE_GAP_SEC` / `MAX_MERGED_SEC` | `0.8` / `60` | 同说话人合并阈值与单段上限 |
+| `MERGE_GAP_SEC_NO_DIAR` | `0.3` | 无说话人标签时的合并窗口；比默认更小，避免把不同人的话揉成一段 |
 
 ### 总结
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
+| `AUTO_SUMMARIZE` | `false` | 是否在转录完成后自动总结。`false` 时任务停在 `transcribed`，需手动 `/summarize`，避免意外计费 |
 | `DEEPSEEK_BASE_URL` | `https://api.deepseek.com` | 可指向中转/代理 |
 | `DEEPSEEK_MODEL` | `deepseek-chat` | 换 `deepseek-reasoner` 会自动剔除不支持的参数 |
 | `SUMMARY_BLOCK_CHARS` | `8000` | 局部摘要的块大小，决定 Map 调用次数 |
@@ -861,6 +1004,7 @@ python -m app.services.summarizer ./demo.json --out ./summary.md
 - 与云端的主要差距在转录吞吐，不在分离；`medium` 比 `large-v3` 快 2~3 倍，精度下降主要体现在专业术语与韩/日文片段。
 - 显存吃紧时按优先级依次降：`ASR_BATCH_SIZE=2` → `ASR_MODEL=small` → `ENABLE_DIARIZATION=false`（省掉 pyannote 的约 2GB）。
 - 说话人分离是在**整段 wav** 上跑的，与切片数无关；长音频分离阶段的显存占用不会因为 `CHUNK_MINUTES` 变小而下降。
+- 上表的端到端时间**不含首次模型下载**：`ASR_ALIGN=auto` 且分离成功时，首次处理某语言还会下载约 1.2GB 的 wav2vec2 对齐模型（中文/韩语各一份）。分离失败或 `ASR_ALIGN=0` 时不会触发。
 
 ### 成本
 
@@ -873,7 +1017,15 @@ python -m app.services.summarizer ./demo.json --out ./summary.md
 <details>
 <summary><b>Pyannote 加载报 403 / gated repo</b></summary>
 
-用**同一个** HF 账号：① 在 <https://hf.co/pyannote/speaker-diarization-3.1> 点接受条款；② 生成 Token 并在容器内 `echo $HF_TOKEN` 确认已注入。`VAD_METHOD=pyannote` 时还需要接受 `pyannote/segmentation-3.0`。
+用**同一个** HF 账号把这三个模型的条款都点一遍 Agree（缺一个就 403，日志里的 URL 会直接告诉你缺哪个）：
+
+| 模型 | 说明 |
+|---|---|
+| <https://hf.co/pyannote/speaker-diarization-3.1> | 主管线 |
+| <https://hf.co/pyannote/segmentation-3.0> | 分割模型 |
+| <https://hf.co/pyannote/speaker-diarization-community-1> | `pyannote.audio` 4.x 的 PLDA 依赖（最容易漏） |
+
+然后生成 Read 权限的 token 填进 `HF_TOKEN`，**重启服务**。进程内会缓存「分离不可用」状态，不重启的话即使补了授权也要等下次启动才会重试。
 </details>
 
 <details>
@@ -910,7 +1062,37 @@ RUN python -c "from faster_whisper import WhisperModel; WhisperModel('large-v3',
 <details>
 <summary><b>韩语/日语片段被识别成英文</b></summary>
 
-`fast-whisper` 的语言检测是按整段音频给出的，混语内容下会自动偏向主导语言。可先按语言人工切分文件，或保持 `ASR_LANGUAGE=auto` 并接受少量误判（总结阶段会保留原文关键词）。
+`auto` 模式下语言是**逐片**检测的（不是整段一次），所以长视频里前几片可能被判成 `en`、后面才变成 `ko`。现在默认取前 3 个「有语音」切片投票，投票完成后固定传给所有切片（`ASR_LANG_VOTE_SAMPLES`）。
+
+如果内容语言已知，最稳妥的做法是直接指定：
+
+```ini
+ASR_LANGUAGE=ko
+```
+
+这样所有切片都不会再做语言检测，也省掉每片的检测开销。
+</details>
+
+<details>
+<summary><b>转录完成后一直停在 transcribed，没有 .md</b></summary>
+
+这是默认行为，不是卡住。`AUTO_SUMMARIZE=false` 时，转录（免费）完成后会停住，等你决定是否花钱总结：
+
+- 只要转录文本：直接用 `data/outputs/{task_id}.transcript.json`；
+- 要总结：`POST /summarize/{task_id}`，或用 `POST /summarize` 上传 JSON；
+- 想全自动：`.env` 里设 `AUTO_SUMMARIZE=true` 并重启服务。
+</details>
+
+<details>
+<summary><b>总结失败（402 余额不足 / 网络错误）后需要重新转录吗</b></summary>
+
+不需要。只要 `{task_id}.transcript.json` 还在，修复问题后重新 `POST /summarize/{task_id}` 即可，只重跑总结，不重新上传、不重新转录。`/status` 里的 `result.retry_url` 就是这个入口。
+</details>
+
+<details>
+<summary><b>分离失败时为什么不再下载词级对齐模型了</b></summary>
+
+对齐（wav2vec2）的唯一用途是把一个 segment 按说话人拆开。分离失败时所有段落都是 `UNKNOWN`，对齐结果不会被读取，却会按语言触发约 1.2GB 下载。`ASR_ALIGN=auto`（默认）因此只在分离成功时才对齐；确实需要 word 级时间戳（做字幕）时设 `ASR_ALIGN=1`。
 </details>
 
 <details>
@@ -935,9 +1117,10 @@ RUN python -c "from faster_whisper import WhisperModel; WhisperModel('large-v3',
 
 1. 任务状态为单进程内存态，不支持多 worker / 多副本。
 2. 无鉴权与限流，公网暴露前需自行加网关或 Token 校验。
-3. 无断点续传与任务重试接口（原始上传文件默认保留，可据此手工重跑）。
+3. 支持从转录 JSON 重跑总结（`POST /summarize/{task_id}`、`POST /summarize`），但没有「从转录中断点继续」的接口；上传文件默认保留，可重新上传。
 4. 切片不做重叠，边界半句依靠「词级拆段 + 字符级去重」修复，极端情况下仍可能丢掉一个词。
 5. 同一段 30s 内两人抢话时，说话人切分会有抖动（已做孤词平滑，但不保证完全准确）。
+6. 说话人分离失败（授权缺失、显存不足等）时会自动降级为无标签转录，此时总结会走「单人口播」prompt，不再产出说话人观察章节。
 
 ---
 

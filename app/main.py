@@ -1,7 +1,15 @@
-"""FastAPI 主应用：上传 -> 后台流水线（抽取/分离/转录/总结）-> 状态查询与结果下载。
+"""FastAPI 主应用：上传 -> 转录（免费）-> 用户确认 -> 总结（付费）-> 下载。
+
+两段式设计（AUTO_SUMMARIZE=false，默认）：
+    转录完全在本地 GPU 上完成，不产生任何 API 费用；产物
+    data/outputs/{task_id}.transcript.json 落盘后任务停在 `transcribed`。
+    只有用户显式调用 /summarize/* 才会调用 DeepSeek 并计费。
+    设 AUTO_SUMMARIZE=true 可恢复「转录完立即总结」的旧行为。
 
 接口：
-    POST /upload              上传媒体文件，立即返回 task_id（后台处理）
+    POST /upload              上传媒体文件，立即返回 task_id（后台抽取+转录）
+    POST /summarize/{task_id} 对已转录任务触发总结（会调用 DeepSeek，产生费用）
+    POST /summarize           导入现成的 transcript.json 并总结
     GET  /status/{task_id}    查询状态与进度百分比
     GET  /result/{task_id}    下载 Markdown 总结
     GET  /healthz             配置与依赖自检（不返回任何密钥）
@@ -45,6 +53,9 @@ class TaskStatus(str, Enum):
     EXTRACTING = "extracting"
     DIARIZING = "diarizing"
     TRANSCRIBING = "transcribing"
+    # 转录完成、产物已落盘，但还没调用付费的总结 API。
+    # 这是「等待用户决定」的中间状态，不是失败，也不是完成。
+    TRANSCRIBED = "transcribed"
     SUMMARIZING = "summarizing"
     COMPLETED = "completed"
     FAILED = "failed"
@@ -55,6 +66,7 @@ STAGE_LABELS: dict[TaskStatus, str] = {
     TaskStatus.EXTRACTING: "抽取音频",
     TaskStatus.DIARIZING: "说话人分离",
     TaskStatus.TRANSCRIBING: "语音转录",
+    TaskStatus.TRANSCRIBED: "转录完成（待总结）",
     TaskStatus.SUMMARIZING: "生成总结",
     TaskStatus.COMPLETED: "已完成",
     TaskStatus.FAILED: "失败",
@@ -115,6 +127,10 @@ _tasks: dict[str, TaskRecord] = {}
 _tasks_lock = threading.RLock()
 _pipeline_semaphore = threading.Semaphore(settings.max_concurrent_tasks)
 
+# 导入 transcript.json 的大小上限（1 小时转录 JSON 通常只有几百 KB）
+MAX_TRANSCRIPT_MB = 50
+_MAX_TRANSCRIPT_BYTES = MAX_TRANSCRIPT_MB * 1024 * 1024
+
 _UPDATABLE = {
     "status", "progress", "detail", "error",
     "started_at", "finished_at", "summary_path", "result",
@@ -132,17 +148,30 @@ def _get(task_id: str) -> TaskRecord | None:
 
 
 _TERMINAL_STATUSES = {TaskStatus.COMPLETED, TaskStatus.FAILED}
+# 这些状态只能向前推进，不能被迟到的进度回调拉回去
+_EARLY_STATUSES = {
+    TaskStatus.QUEUED,
+    TaskStatus.EXTRACTING,
+    TaskStatus.DIARIZING,
+    TaskStatus.TRANSCRIBING,
+}
 
 
-def _update(task_id: str, **changes: Any) -> None:
+def _update(task_id: str, *, force: bool = False, **changes: Any) -> None:
     with _tasks_lock:
         record = _tasks.get(task_id)
         if record is None:
             return
-        # 终态不可回退（后台线程迟到的一次进度回调不应把 completed 改回 transcribing）
-        if record.status in _TERMINAL_STATUSES and "status" in changes and changes["status"] not in _TERMINAL_STATUSES:
-            logger.debug("任务 %s 已终态（%s），忽略状态回退", task_id, record.status.value)
-            return
+        new_status = changes.get("status")
+        if not force and new_status is not None:
+            # 终态不可回退（后台线程迟到的一次进度回调不应把 completed 改回 transcribing）
+            if record.status in _TERMINAL_STATUSES and new_status not in _TERMINAL_STATUSES:
+                logger.debug("任务 %s 已终态（%s），忽略状态回退", task_id, record.status.value)
+                return
+            # 转录完成后在等用户触发总结：忽略转录阶段的迟到进度回调
+            if record.status == TaskStatus.TRANSCRIBED and new_status in _EARLY_STATUSES:
+                logger.debug("任务 %s 等待总结，忽略迟到的进度（%s）", task_id, new_status.value)
+                return
         for key, value in changes.items():
             if key in _UPDATABLE:
                 setattr(record, key, value)
@@ -159,7 +188,8 @@ def _purge_expired() -> None:
             task_id
             for task_id, record in _tasks.items()
             if (record.finished_at or record.created_at).timestamp() < deadline
-            and record.status in {TaskStatus.COMPLETED, TaskStatus.FAILED}
+            # transcribed 也在等保留期：用户一直不总结的话，产物同样会被回收
+            and record.status in {TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.TRANSCRIBED}
         ]
         for task_id in expired:
             _tasks.pop(task_id, None)
@@ -196,18 +226,107 @@ def _progress_bridge(task_id: str, default_stage: TaskStatus) -> Callable[[str, 
     return callback
 
 
+def _acquire_pipeline_slot(task_id: str) -> None:
+    """串行化 GPU 任务；排队时把 detail 写清楚，避免 /status 看起来像卡死。"""
+    if _pipeline_semaphore.acquire(blocking=False):
+        return
+    _update(task_id, detail="排队中：等待前一个任务释放 GPU")
+    _pipeline_semaphore.acquire()
+
+
+def _summary_result(
+    task_id: str,
+    transcribed: dict,
+    transcript_path: Path,
+    total_audio: float,
+    summary: dict,
+) -> dict[str, Any]:
+    return {
+        "summary_path": str(settings.summary_path(task_id)),
+        "transcript_path": str(transcript_path),
+        "num_segments": transcribed.get("num_segments", 0),
+        "num_blocks": summary["meta"].get("num_blocks", 0),
+        "speakers": transcribed.get("speakers", []),
+        "language": transcribed.get("language"),
+        "diarized": bool(summary["meta"].get("diarized")),
+        "audio_duration_sec": total_audio,
+        "tokens": summary["usage"],
+    }
+
+
+def _summarize_and_complete(
+    task_id: str,
+    transcribed: dict,
+    transcript_path: Path,
+    total_audio: float,
+) -> None:
+    """调用 DeepSeek 生成总结并置为 completed（仅 AUTO_SUMMARIZE=true 时走这里）。"""
+    _update(
+        task_id,
+        status=TaskStatus.SUMMARIZING,
+        progress=STAGE_RANGES[TaskStatus.SUMMARIZING][0],
+        detail=f"DeepSeek 分段摘要（{transcribed.get('num_segments', 0)} 段）",
+        error=None,
+    )
+    summary = summarizer.summarize(
+        transcribed,
+        block_chars=settings.summary_block_chars,
+        save_to=settings.summary_path(task_id),
+    )
+    _update(
+        task_id,
+        status=TaskStatus.COMPLETED,
+        progress=100.0,
+        detail="已完成",
+        finished_at=datetime.now(timezone.utc),
+        summary_path=settings.summary_path(task_id),
+        result=_summary_result(task_id, transcribed, transcript_path, total_audio, summary),
+    )
+    logger.info("任务 %s 完成：%s", task_id, settings.summary_path(task_id))
+
+
+def _pause_for_summary(
+    task_id: str,
+    transcribed: dict,
+    transcript_path: Path,
+    total_audio: float,
+) -> None:
+    """转录已完成但未调用付费 API：停在 transcribed，等用户显式触发。"""
+    _update(
+        task_id,
+        status=TaskStatus.TRANSCRIBED,
+        progress=STAGE_RANGES[TaskStatus.TRANSCRIBING][1],
+        detail="转录完成，等待手动触发总结（未调用付费 API）",
+        finished_at=datetime.now(timezone.utc),
+        result={
+            "transcript_path": str(transcript_path),
+            "num_segments": transcribed.get("num_segments", 0),
+            "speakers": transcribed.get("speakers", []),
+            "language": transcribed.get("language"),
+            "diarized": bool(transcribed.get("diarized")),
+            "audio_duration_sec": total_audio,
+            "summarize_url": f"/summarize/{task_id}",
+            "hint": (
+                "转录免费且已完成。需要总结时 POST /summarize/{task_id}"
+                "（会调用 DeepSeek 并产生费用）；想自动执行请设 AUTO_SUMMARIZE=true。"
+            ),
+        },
+    )
+    logger.info("任务 %s 转录完成，等待手动触发总结：%s", task_id, transcript_path)
+
+
 def run_pipeline(task_id: str) -> None:
-    """后台任务主体（同步阻塞，由 BackgroundTasks 放到线程池执行）。"""
+    """后台任务主体（同步阻塞，由 BackgroundTasks 放到线程池执行）。
+
+    只负责「抽取 → 转录 → 落盘 JSON」。总结默认**不自动执行**：
+    DeepSeek 调用要花钱，由用户通过 POST /summarize/{task_id} 显式决定。
+    """
     record = _get(task_id)
     if record is None:
         logger.error("任务 %s 不存在，跳过", task_id)
         return
 
-    acquired_here = _pipeline_semaphore.acquire(blocking=False)
-    if not acquired_here:
-        _update(task_id, detail="排队中：等待前一个任务释放 GPU")
-        _pipeline_semaphore.acquire()
-        acquired_here = True
+    _acquire_pipeline_slot(task_id)
 
     work_dir = settings.task_audio_dir(task_id)
     try:
@@ -232,7 +351,7 @@ def run_pipeline(task_id: str) -> None:
             detail=f"音频 {total_audio:.0f}s，切分为 {len(chunks)} 片",
         )
 
-        # ---- 2. 转录 + 说话人分离 ----
+        # ---- 2. 转录 + 说话人分离（纯本地，不产生 API 费用）----
         transcribed = transcribe.transcribe_task(
             chunks,
             language=settings.asr_language,
@@ -243,41 +362,17 @@ def run_pipeline(task_id: str) -> None:
         transcript_path.write_text(
             json.dumps(transcribed, ensure_ascii=False, indent=2), encoding="utf-8"
         )
-        _update(task_id, progress=STAGE_RANGES[TaskStatus.TRANSCRIBING][1], detail="转录完成，开始生成总结")
-
-        # ---- 3. 两阶段总结 ----
         _update(
             task_id,
-            status=TaskStatus.SUMMARIZING,
-            progress=STAGE_RANGES[TaskStatus.SUMMARIZING][0],
-            detail=f"DeepSeek 分段摘要（{transcribed.get('num_segments', 0)} 段）",
-        )
-        summary = summarizer.summarize(
-            transcribed,
-            block_chars=settings.summary_block_chars,
-            save_to=settings.summary_path(task_id),
+            progress=STAGE_RANGES[TaskStatus.TRANSCRIBING][1],
+            detail="转录完成，JSON 已落盘",
         )
 
-        # ---- 4. 收尾 ----
-        _update(
-            task_id,
-            status=TaskStatus.COMPLETED,
-            progress=100.0,
-            detail="已完成",
-            finished_at=datetime.now(timezone.utc),
-            summary_path=settings.summary_path(task_id),
-            result={
-                "summary_path": str(settings.summary_path(task_id)),
-                "transcript_path": str(transcript_path),
-                "num_segments": transcribed.get("num_segments", 0),
-                "num_blocks": summary["meta"].get("num_blocks", 0),
-                "speakers": transcribed.get("speakers", []),
-                "language": transcribed.get("language"),
-                "audio_duration_sec": total_audio,
-                "tokens": summary["usage"],
-            },
-        )
-        logger.info("任务 %s 完成：%s", task_id, settings.summary_path(task_id))
+        # ---- 3. 收尾：自动总结 or 停在这里等用户确认 ----
+        if settings.auto_summarize:
+            _summarize_and_complete(task_id, transcribed, transcript_path, total_audio)
+        else:
+            _pause_for_summary(task_id, transcribed, transcript_path, total_audio)
 
     except audio.AudioProcessingError as exc:
         _fail(task_id, f"音频处理失败：{exc}")
@@ -291,25 +386,83 @@ def run_pipeline(task_id: str) -> None:
     finally:
         # 释放切片/整段 wav（原始上传文件保留，便于重跑或排查）
         audio.cleanup_task_dir(work_dir)
-        if acquired_here:
-            _pipeline_semaphore.release()
+        _pipeline_semaphore.release()
+
+
+def run_summarize(task_id: str) -> None:
+    """只跑总结：读取已落盘的 {task_id}.transcript.json，不重新转录、不重新上传。
+
+    供 POST /summarize/{task_id} 与 POST /summarize（导入 JSON）复用，
+    也是总结阶段失败（如 402 余额不足）后的恢复路径。
+    """
+    record = _get(task_id)
+    if record is None:
+        logger.error("任务 %s 不存在，跳过总结", task_id)
+        return
+
+    transcript_path = settings.transcript_path(task_id)
+    if not transcript_path.exists():
+        _fail(task_id, f"找不到转录产物：{transcript_path}（请重新上传媒体或导入 transcript.json）")
+        return
+
+    _acquire_pipeline_slot(task_id)
+    try:
+        payload = json.loads(transcript_path.read_text(encoding="utf-8"))
+        _update(
+            task_id,
+            force=True,
+            status=TaskStatus.SUMMARIZING,
+            progress=STAGE_RANGES[TaskStatus.SUMMARIZING][0],
+            detail=f"DeepSeek 分段摘要（{payload.get('num_segments', 0)} 段）",
+            error=None,
+            finished_at=None,
+        )
+        summary = summarizer.summarize(
+            payload,
+            block_chars=settings.summary_block_chars,
+            save_to=settings.summary_path(task_id),
+        )
+        _update(
+            task_id,
+            force=True,
+            status=TaskStatus.COMPLETED,
+            progress=100.0,
+            detail="已完成",
+            finished_at=datetime.now(timezone.utc),
+            summary_path=settings.summary_path(task_id),
+            result=_summary_result(
+                task_id, payload, transcript_path, float(payload.get("duration_sec") or 0.0), summary
+            ),
+        )
+        logger.info("任务 %s 总结完成：%s", task_id, settings.summary_path(task_id))
+    except summarizer.SummarizationError as exc:
+        _fail(task_id, f"总结失败：{exc}")
+    except json.JSONDecodeError as exc:
+        _fail(task_id, f"转录 JSON 解析失败（{transcript_path}）：{exc}")
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("任务 %s 总结时出现未预期异常", task_id)
+        _fail(task_id, f"总结异常：{exc}")
+    finally:
+        _pipeline_semaphore.release()
 
 
 def _fail(task_id: str, message: str) -> None:
     logger.error("任务 %s 失败：%s", task_id, message)
-    # 转录已完成、只在总结阶段失败时，把产物路径回传，方便单独重跑总结而不用重新上传
+    # 转录已完成、只在总结阶段失败时，把产物路径与重跑入口回传，不需要重新上传/转录
     result = None
     transcript = settings.transcript_path(task_id)
     if transcript.exists():
         result = {
             "transcript_path": str(transcript),
+            "retry_url": f"/summarize/{task_id}",
             "hint": (
-                "转录已完成，可单独重跑总结："
-                f"python -m app.services.summarizer {transcript} --out {settings.summary_path(task_id)}"
+                "转录已完成，修复问题后 POST /summarize/{task_id} 可直接重跑总结"
+                "（不会重新转录，也不需要重新上传）。"
             ),
         }
     _update(
         task_id,
+        force=True,
         status=TaskStatus.FAILED,
         detail="处理失败",
         error=message[:2000],
@@ -373,23 +526,53 @@ class TaskStatusResponse(BaseModel):
     result: dict[str, Any] | None = None
 
 
+class SummarizeResponse(BaseModel):
+    task_id: str
+    status: TaskStatus
+    transcript_path: str
+    status_url: str
+    result_url: str
+    note: str
+
+
 # ---------------------------------------------------------------------------
 # 应用
 # ---------------------------------------------------------------------------
+# 第三方库的 INFO 会刷几百行（每个 HF 请求一条），会淹没业务日志
+_NOISY_LOGGERS = (
+    "httpx", "httpx2", "httpcore", "huggingface_hub", "urllib3",
+    "openai", "filelock", "fsspec", "pyannote",
+)
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     logging.basicConfig(
         level=getattr(logging, settings.log_level, logging.INFO),
         format="%(asctime)s | %(levelname)-7s | %(name)s | %(message)s",
     )
+    for name in _NOISY_LOGGERS:
+        logging.getLogger(name).setLevel(logging.WARNING)
+
     settings.ensure_dirs()
     logger.info("启动配置：%s", json.dumps(settings.as_dict(), ensure_ascii=False))
     if not shutil.which("ffmpeg"):
         logger.error("环境中找不到 ffmpeg，音频抽取会失败")
     if settings.enable_diarization and not settings.hf_token_present:
         logger.warning("未检测到 HF_TOKEN，任务将降级为「无说话人标签」")
+    if settings.enable_diarization:
+        logger.info(
+            "说话人分离要求同一 HF 账号已 Agree 三个 gated 模型：%s、"
+            "pyannote/segmentation-3.0、pyannote/speaker-diarization-community-1（详见 README）",
+            settings.diarization_model,
+        )
     if not settings.deepseek_key_present:
-        logger.warning("未检测到 DEEPSEEK_API_KEY，总结阶段会失败")
+        logger.warning("未检测到 DEEPSEEK_API_KEY，手动总结会失败")
+    if not settings.auto_summarize:
+        logger.info(
+            "AUTO_SUMMARIZE=false：转录完成后停在 transcribed（不调用付费 API），"
+            "需显式 POST /summarize/{task_id} 或 POST /summarize 导入 JSON"
+        )
     yield
     logger.info("服务关闭")
 
@@ -448,6 +631,14 @@ def get_result(task_id: str) -> FileResponse:
     record = _get(task_id)
     if record is None:
         raise HTTPException(status_code=404, detail=f"任务不存在：{task_id}")
+    if record.status == TaskStatus.TRANSCRIBED:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "转录已完成，但尚未生成总结（避免自动产生 API 费用）。"
+                f"请先 POST /summarize/{task_id} 触发总结"
+            ),
+        )
     if record.status != TaskStatus.COMPLETED:
         raise HTTPException(status_code=409, detail=f"任务尚未完成（当前状态：{record.status.value}）")
 
@@ -461,12 +652,134 @@ def get_result(task_id: str) -> FileResponse:
     )
 
 
+# ---------------------------------------------------------------------------
+# 手动总结：把「免费转录」与「付费总结」解耦
+# ---------------------------------------------------------------------------
+def _ensure_summarizable(task_id: str) -> Path:
+    """校验任务能否进入总结阶段，返回 transcript 路径。"""
+    record = _get(task_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail=f"任务不存在：{task_id}")
+
+    transcript = settings.transcript_path(task_id)
+    if not transcript.exists():
+        raise HTTPException(status_code=409, detail="该任务没有转录产物，请先上传媒体完成转录")
+
+    if record.status == TaskStatus.SUMMARIZING:
+        raise HTTPException(status_code=409, detail="该任务正在总结中，请勿重复触发")
+    if record.status in _EARLY_STATUSES:
+        raise HTTPException(
+            status_code=409, detail=f"任务尚未转录完成（当前状态：{record.status.value}）"
+        )
+    if record.status == TaskStatus.COMPLETED and settings.summary_path(task_id).exists():
+        raise HTTPException(
+            status_code=409,
+            detail="总结已存在。如需重跑请先删除对应 .md，或改用 POST /summarize 导入 JSON 生成新任务",
+        )
+    return transcript
+
+
+@app.post(
+    "/summarize/{task_id}",
+    response_model=SummarizeResponse,
+    status_code=202,
+    summary="对已转录任务触发总结（会调用付费 API）",
+)
+def trigger_summarize(task_id: str, background_tasks: BackgroundTasks) -> SummarizeResponse:
+    """转录完成后由用户显式触发；只读 transcript.json，不重新转录。"""
+    transcript = _ensure_summarizable(task_id)
+    _update(
+        task_id,
+        force=True,
+        status=TaskStatus.SUMMARIZING,
+        progress=STAGE_RANGES[TaskStatus.SUMMARIZING][0],
+        detail="已收到总结请求，排队中",
+        error=None,
+        finished_at=None,
+    )
+    background_tasks.add_task(run_summarize, task_id)
+    logger.info("任务 %s 收到手动总结请求（将调用 DeepSeek）", task_id)
+    return SummarizeResponse(
+        task_id=task_id,
+        status=TaskStatus.SUMMARIZING,
+        transcript_path=str(transcript),
+        status_url=f"/status/{task_id}",
+        result_url=f"/result/{task_id}",
+        note="已开始总结，会调用 DeepSeek API 并产生费用",
+    )
+
+
+@app.post(
+    "/summarize",
+    response_model=SummarizeResponse,
+    status_code=202,
+    summary="导入 transcript.json 并生成总结（会调用付费 API）",
+)
+async def summarize_import(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+) -> SummarizeResponse:
+    """把现成的 transcript.json 交给服务总结，适合换机器或复用历史转录。"""
+    raw = await file.read(_MAX_TRANSCRIPT_BYTES + 1)
+    await file.close()
+    if not raw:
+        raise HTTPException(status_code=400, detail="上传内容为空")
+    if len(raw) > _MAX_TRANSCRIPT_BYTES:
+        raise HTTPException(status_code=413, detail=f"转录 JSON 超过上限 {MAX_TRANSCRIPT_MB} MB")
+
+    try:
+        payload = json.loads(raw.decode("utf-8-sig"))
+    except UnicodeDecodeError as exc:
+        raise HTTPException(status_code=400, detail="JSON 不是 UTF-8 编码") from exc
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=400, detail=f"JSON 解析失败：{exc}") from exc
+
+    try:
+        normalized = summarizer.normalize_payload(payload)
+    except summarizer.SummarizationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    task_id = uuid.uuid4().hex
+    transcript_path = settings.transcript_path(task_id)
+    transcript_path.write_text(
+        json.dumps(normalized, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+    filename = Path(file.filename or "transcript.json").name
+    _register(
+        TaskRecord(
+            task_id=task_id,
+            filename=filename,
+            source_path=transcript_path,
+            size_bytes=len(raw),
+            status=TaskStatus.SUMMARIZING,
+            progress=STAGE_RANGES[TaskStatus.SUMMARIZING][0],
+            detail="已导入转录 JSON，排队总结",
+            started_at=datetime.now(timezone.utc),
+        )
+    )
+    logger.info("导入转录 JSON %s（%.1f KB）-> 任务 %s", filename, len(raw) / 1024, task_id)
+    background_tasks.add_task(run_summarize, task_id)
+    return SummarizeResponse(
+        task_id=task_id,
+        status=TaskStatus.SUMMARIZING,
+        transcript_path=str(transcript_path),
+        status_url=f"/status/{task_id}",
+        result_url=f"/result/{task_id}",
+        note="已导入转录 JSON 并开始总结，会调用 DeepSeek API 并产生费用",
+    )
+
+
 @app.get("/healthz", summary="自检")
 def healthz() -> dict[str, Any]:
+    with _tasks_lock:
+        total = len(_tasks)
+        pending_summary = sum(1 for r in _tasks.values() if r.status == TaskStatus.TRANSCRIBED)
     return {
         "status": "ok",
         "ffmpeg": bool(shutil.which("ffmpeg")),
         "ffprobe": bool(shutil.which("ffprobe")),
         "config": settings.as_dict(),
-        "tasks_in_memory": len(_tasks),
+        "tasks_in_memory": total,
+        "pending_summary": pending_summary,
     }

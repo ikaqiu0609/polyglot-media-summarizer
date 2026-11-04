@@ -55,14 +55,28 @@ BATCH_SIZE = int(os.getenv("ASR_BATCH_SIZE", "16"))
 # 想强制单语时可设 ASR_LANGUAGE=en
 LANGUAGE = os.getenv("ASR_LANGUAGE", "auto")
 VAD_METHOD = os.getenv("VAD_METHOD", "silero")  # silero（无需额外许可） / pyannote
-ALIGN_ENABLED = os.getenv("ASR_ALIGN", "1").lower() not in {"0", "false", "no"}
+
+# 词级对齐三态：
+#   auto（默认）—— 只有说话人分离成功时才对齐。对齐结果仅用于「按说话人拆段」，
+#                  分离失败时它毫无用处，却会触发 1.2GB/语言的 wav2vec2 下载。
+#   1 / true    —— 强制对齐（即使没有说话人标签，也保留 word 级时间戳）。
+#   0 / false   —— 完全关闭。
+ALIGN_MODE = (os.getenv("ASR_ALIGN", "auto") or "auto").strip().lower()
+ALIGN_ENABLED = ALIGN_MODE not in {"0", "false", "no", "off"}
+ALIGN_ONLY_WITH_DIARIZATION = ALIGN_MODE in {"auto", ""}
 
 DIARIZATION_MODEL = os.getenv("DIARIZATION_MODEL", "pyannote/speaker-diarization-3.1")
 DIAR_MIN_SPEAKERS = os.getenv("DIAR_MIN_SPEAKERS")  # 可选：已知说话人数时提升准确率
 DIAR_MAX_SPEAKERS = os.getenv("DIAR_MAX_SPEAKERS")
 
 MERGE_GAP_SEC = float(os.getenv("MERGE_GAP_SEC", "0.8"))       # 同说话人合并阈值
+# 没有说话人标签时，所有人都是 UNKNOWN，若沿用 0.8s 会把不同人的话揉进同一段
+MERGE_GAP_SEC_NO_DIAR = float(os.getenv("MERGE_GAP_SEC_NO_DIAR", "0.3"))
 MAX_MERGED_SEC = float(os.getenv("MAX_MERGED_SEC", "60"))        # 合并后单段上限，防止整集变一段
+
+# 前 N 个「有语音」的切片各投一票决定全局语言，之后固定传给所有切片。
+# 逐片 auto 检测会让同一文件的语言来回跳（例如前 20 分钟被判成 en、之后是 ko）。
+LANG_VOTE_SAMPLES = max(1, int(os.getenv("ASR_LANG_VOTE_SAMPLES", "3")))
 
 ASR_OPTIONS: dict[str, Any] = {
     # 长音频 + 无重叠切片场景下，关闭上文条件可显著减少「复读机」幻觉
@@ -94,6 +108,21 @@ class DiarTurn:
 # 通用小工具
 # ---------------------------------------------------------------------------
 _murmurai_mod: Any = None
+
+# 对齐模型按语言缓存。whisperx 的 load_align_model 会按语言下载 wav2vec2（约 1.2GB），
+# 原来每个切片都加载一次，长视频等于把同一份权重反复搬进显存。
+_ALIGN_CACHE: dict[str, tuple[Any, Any]] = {}
+# 本任务内已确认拉取失败的语言，避免每个切片都再试一次
+_ALIGN_UNAVAILABLE: set[str] = set()
+# 本进程内说话人分离不可用的原因（多为 gated repo 403）。
+# 置为非空后不再重复下载 pyannote 权重，修复授权后重启服务即可恢复。
+_DIAR_UNAVAILABLE: str = ""
+
+
+def _clear_align_cache() -> None:
+    """任务收尾时释放对齐模型（它们是按语言常驻的，不随单切片销毁）。"""
+    _ALIGN_CACHE.clear()
+    _ALIGN_UNAVAILABLE.clear()
 
 
 def _mm():
@@ -313,21 +342,38 @@ def _transcribe_chunk(
 
 
 def _align_segments(segments: list[dict], audio_path: Path, language: str) -> list[dict]:
-    """词级对齐（提升说话人切分精度）。失败则降级为 segment 级时间戳，不中断任务。"""
-    mm = _mm()
-    align_model = None
+    """词级对齐（仅用于「按说话人拆段」）。失败则降级为 segment 级时间戳，不中断任务。
+
+    对齐模型按语言缓存复用：同一任务里 10 个韩语切片只加载一次，而不是每片重来。
+    """
+    if language in _ALIGN_UNAVAILABLE:
+        return segments
+
+    cached = _ALIGN_CACHE.get(language)
+    if cached is None:
+        mm = _mm()
+        try:
+            logger.info("加载词级对齐模型（language=%s，首次会自动下载约 1.2GB）", language)
+            started = time.time()
+            cached = mm.load_align_model(language_code=language, device=DEVICE)
+            _ALIGN_CACHE[language] = cached
+            logger.info("对齐模型加载完成 %.1fs（language=%s）", time.time() - started, language)
+        except Exception as exc:
+            _ALIGN_UNAVAILABLE.add(language)
+            logger.warning(
+                "词级对齐模型不可用（language=%s），本任务跳过对齐、改用 segment 级时间戳: %s",
+                language, exc,
+            )
+            return segments
+
+    align_model, metadata = cached
     try:
-        align_model, metadata = mm.load_align_model(language_code=language, device=DEVICE)
         aligned = mm.align(segments, align_model, metadata, str(audio_path), device=DEVICE)
         # whisperx 3.1 返回 list，3.3+ 返回 dict
         return aligned["segments"] if isinstance(aligned, dict) else aligned
     except Exception as exc:
         logger.warning("词级对齐失败（language=%s），降级为 segment 级时间戳: %s", language, exc)
         return segments
-    finally:
-        if align_model is not None:
-            del align_model
-        free_cuda_memory()
 
 
 def _offset_segments(segments: list[dict], offset: float) -> None:
@@ -613,18 +659,30 @@ def transcribe_task(
     turns: list[DiarTurn] = []
     detected_languages: list[str] = []
     collected: list[dict] = []
+    lang_votes: Counter[str] = Counter()
+    fixed_lang: str | None = lang
     started = time.time()
+
+    global _DIAR_UNAVAILABLE
 
     try:
         model = load_asr_model()
 
-        if do_diarize:
+        if do_diarize and _DIAR_UNAVAILABLE:
+            # 已经确认拉不起 pyannote（多为 gated repo 403）：本进程内不再重复下载权重
+            logger.info(
+                "说话人分离在本进程内已标记为不可用，直接跳过（原因：%s）。修复授权后请重启服务",
+                _DIAR_UNAVAILABLE,
+            )
+            report("diarizing", 1.0, "说话人分离不可用（本次已跳过）")
+        elif do_diarize:
             try:
                 report("diarizing", 0.0, "加载说话人分离模型")
                 diar_pipeline = build_diarization_pipeline()
                 turns = diarize(diar_pipeline, source_wav)
                 report("diarizing", 1.0, f"识别到 {len({t.speaker for t in turns})} 位说话人")
             except Exception as exc:
+                _DIAR_UNAVAILABLE = str(exc)[:500]
                 logger.error("说话人分离失败，本次结果将不含说话人标签: %s", exc)
                 report("diarizing", 1.0, "说话人分离失败，已降级为无标签转录")
                 turns = []
@@ -634,13 +692,25 @@ def transcribe_task(
             report("transcribing", chunk.index / total_chunks, f"转录切片 {chunk.index + 1}/{total_chunks}")
             logger.info("转录切片 %d/%d（start=%.1fs, %.1fs）", chunk.index + 1, len(chunks), chunk.start_sec, chunk.duration_sec)
             t0 = time.time()
-            result = _transcribe_chunk(model, chunk.path, BATCH_SIZE, lang)
+            result = _transcribe_chunk(model, chunk.path, BATCH_SIZE, fixed_lang)
 
-            chunk_language = result.get("language") or lang or "en"
+            chunk_language = result.get("language") or fixed_lang or "en"
             detected_languages.append(chunk_language)
             segments = [dict(s) for s in (result.get("segments") or [])]
 
-            if ALIGN_ENABLED and segments:
+            # 前 N 个「有语音」的切片投票决定全局语言，之后固定传参：
+            # 逐片 auto 会让同一文件的语言来回跳（前 20 分钟 en、后面 ko），而且每片多花一次检测。
+            if fixed_lang is None and segments:
+                lang_votes[chunk_language] += 1
+                if sum(lang_votes.values()) >= LANG_VOTE_SAMPLES:
+                    fixed_lang = lang_votes.most_common(1)[0][0]
+                    logger.info(
+                        "语言投票确定：%s（票数 %s），后续切片固定使用", fixed_lang, dict(lang_votes)
+                    )
+
+            # 对齐结果只用于「按说话人拆段」：分离失败时 words 根本不会被读取，
+            # 却会触发 1.2GB/语言的 wav2vec2 下载 —— auto 模式下直接跳过。
+            if ALIGN_ENABLED and segments and (turns or not ALIGN_ONLY_WITH_DIARIZATION):
                 segments = _align_segments(segments, chunk.path, chunk_language)
 
             _offset_segments(segments, chunk.start_sec)
@@ -660,7 +730,14 @@ def transcribe_task(
             raise TranscriptionError("所有切片都没有转录出文本，请检查音频是否含有效语音")
 
         report("transcribing", 1.0, "转录与对齐完成，开始后处理")
-        segments = postprocess_segments(collected)
+        diarized = bool(turns)
+        gap_sec = MERGE_GAP_SEC if diarized else MERGE_GAP_SEC_NO_DIAR
+        if not diarized:
+            logger.info(
+                "未获得说话人标签：合并窗口收紧为 %.1fs（默认 %.1fs），避免把不同人的话揉成一段",
+                gap_sec, MERGE_GAP_SEC,
+            )
+        segments = postprocess_segments(collected, gap_sec=gap_sec)
         mapping = renumber_speakers(segments)
 
         result_payload = {
@@ -688,6 +765,7 @@ def transcribe_task(
             except Exception:
                 pass
             del diar_pipeline
+        _clear_align_cache()
         free_cuda_memory()
         logger.info("模型与显存已释放（可用显存 %.0f MB）", _available_vram_mb())
 

@@ -38,6 +38,14 @@ else:
     load_dotenv(dotenv_path=ENV_FILE, encoding="utf-8", override=False)
 
 
+# HuggingFace 的日志噪音开关（必须在 huggingface_hub 首次导入前设置）。
+# 本文件位于所有业务模块的导入链最上游，所以放这里最可靠；.env 里显式写同名变量可覆盖。
+#   - 关闭 Windows 上「不支持 symlink」的长篇 UserWarning
+#   - 关闭模型下载的 tqdm 进度条（它会和 logging 输出交错成半行）
+os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
+os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+
+
 def resolve_path(raw: str | Path, base: Path = PROJECT_ROOT) -> Path:
     """把配置里的路径解析成跨平台的绝对路径。
 
@@ -125,6 +133,8 @@ class Settings:
     asr_language: str
     enable_diarization: bool
     summary_block_chars: int
+    # 转录完成后是否自动调用 DeepSeek。默认 False：转录免费，总结要花钱，交给用户决定
+    auto_summarize: bool
 
     # 运行时行为
     max_concurrent_tasks: int
@@ -133,6 +143,10 @@ class Settings:
 
     # 只读诊断信息（不含密钥本体）
     asr_model: str
+    asr_align: str
+    asr_batch_size: int
+    vad_method: str
+    diarization_model: str
     deepseek_model: str
     hf_token_present: bool
     deepseek_key_present: bool
@@ -172,9 +186,14 @@ class Settings:
             "asr_language": self.asr_language,
             "enable_diarization": self.enable_diarization,
             "summary_block_chars": self.summary_block_chars,
+            "auto_summarize": self.auto_summarize,
             "max_concurrent_tasks": self.max_concurrent_tasks,
             "task_retention_hours": self.task_retention_hours,
             "asr_model": self.asr_model,
+            "asr_align": self.asr_align,
+            "asr_batch_size": self.asr_batch_size,
+            "vad_method": self.vad_method,
+            "diarization_model": self.diarization_model,
             "deepseek_model": self.deepseek_model,
             "hf_token_present": self.hf_token_present,
             "deepseek_key_present": self.deepseek_key_present,
@@ -195,10 +214,16 @@ class Settings:
             asr_language=(_env("ASR_LANGUAGE", "auto") or "auto"),
             enable_diarization=_env_bool("ENABLE_DIARIZATION", True),
             summary_block_chars=_env_int("SUMMARY_BLOCK_CHARS", 8000),
+            auto_summarize=_env_bool("AUTO_SUMMARIZE", False),
             max_concurrent_tasks=max(1, _env_int("MAX_CONCURRENT_TASKS", 1)),
             task_retention_hours=_env_float("TASK_RETENTION_HOURS", 24.0),
             log_level=(_env("LOG_LEVEL", "INFO") or "INFO").upper(),
             asr_model=_env("ASR_MODEL", "large-v3") or "large-v3",
+            asr_align=(_env("ASR_ALIGN", "auto") or "auto").strip().lower(),
+            asr_batch_size=_env_int("ASR_BATCH_SIZE", 16),
+            vad_method=(_env("VAD_METHOD", "silero") or "silero").strip().lower(),
+            diarization_model=_env("DIARIZATION_MODEL", "pyannote/speaker-diarization-3.1")
+            or "pyannote/speaker-diarization-3.1",
             deepseek_model=_env("DEEPSEEK_MODEL", "deepseek-chat") or "deepseek-chat",
             hf_token_present=bool(_env("HF_TOKEN") or _env("HUGGINGFACE_TOKEN") or _env("HF_HUB_TOKEN")),
             deepseek_key_present=bool(_env("DEEPSEEK_API_KEY")),

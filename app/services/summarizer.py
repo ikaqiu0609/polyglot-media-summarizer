@@ -90,6 +90,42 @@ SYSTEM_PROMPT = """你是一位资深的多语言内容分析师，擅长把口�
 ## 六、术语与专有名词
 表格形式：| 原文 | 中文解释 | 出现时间 |"""
 
+SINGLE_SPEAKER_SYSTEM_PROMPT = """你是一位资深的多语言内容分析师，擅长把口语化的音视频转录整理成可直接阅读的中文结构化总结。
+
+注意：本次转录**没有做说话人分离**，所有内容都属于同一个讲述者，请按「单人口播 / 单人讲解」处理。
+
+硬性规则（必须全部遵守）：
+1. 全部使用简体中文输出。人名、公司名、产品名、技术术语保留原文（英文/韩文/日文），首次出现时用括号给出中文解释，例如：Retrieval-Augmented Generation（检索增强生成）。
+2. 时间戳必须保留，格式为 HH:MM:SS，只在「章节脉络」和「关键观点」中使用，且只能使用转录中真实出现过的时间点，严禁编造或估算。
+3. 不要出现 Speaker 1 / 说话人 1 这类标签，也不要猜测讲述者身份；需要指代时用「讲述者」。
+4. 严格区分三类信息：转录中明确陈述的事实、讲述者的主观观点、以及尚待确认的疑问。事实要写清楚数据与条件（数字、时间、版本、比例等）。
+5. 若转录中出现韩语、日语或混合语言片段，先给出中文意译，再在括号内保留关键词原文。
+6. 禁止编造转录中不存在的内容；信息不足时写「转录中未提及」，不要用常识补全。
+7. 输出纯 Markdown，不要用代码块包裹整篇总结，不要输出「以下是总结」这类寒暄。
+
+固定输出结构：
+# {一句话标题：说清主题与结论倾向}
+> 时长 HH:MM:SS ｜ 未做说话人分离 ｜ 检测语言 xx
+
+## 一、内容概览
+3~6 句话说明：这是什么内容、讨论了什么、结论是什么。让没看过原文的人 1 分钟能抓住重点。
+
+## 二、章节脉络
+按时间顺序分 3~8 个章节，每章一个小标题，格式：
+### [HH:MM:SS - HH:MM:SS] 章节标题
+- 该章节讲了什么（2~4 条）
+
+## 三、关键观点与事实
+按主题（不是按时间）归纳，每条格式：
+- **观点/结论**：具体内容 ｜ 依据：数据/例子（如有）
+把前后观点变化或存在分歧的地方单独列出。
+
+## 四、待办与未解决问题
+明确提到的行动项（做什么、什么时候）与悬而未决的问题；没有就写「无」。
+
+## 五、术语与专有名词
+表格形式：| 原文 | 中文解释 | 出现时间 |"""
+
 LOCAL_SYSTEM_PROMPT = """你是音视频转录的片段压缩器。你的任务是把一小段带时间戳的转录压缩为结构化 JSON，供后续全局汇总使用。
 
 要求：
@@ -427,7 +463,20 @@ def _valid_timestamps(block: TranscriptBlock) -> set[str]:
     return stamps
 
 
-def summarize_block(block: TranscriptBlock, total: int, duration: float, language: str, speakers: Sequence[str]) -> dict:
+def _speaker_label(speakers: Sequence[str], diarized: bool) -> str:
+    if not diarized:
+        return "未做说话人分离（单人口播）"
+    return "、".join(speakers) or "未知"
+
+
+def summarize_block(
+    block: TranscriptBlock,
+    total: int,
+    duration: float,
+    language: str,
+    speakers: Sequence[str],
+    diarized: bool = True,
+) -> dict:
     """对一个 block 做局部摘要，失败时返回兜底结构（不阻断整体流程）。"""
     user_prompt = (
         LOCAL_USER_TEMPLATE.replace("%INDEX%", str(block.index + 1))
@@ -436,7 +485,7 @@ def summarize_block(block: TranscriptBlock, total: int, duration: float, languag
         .replace("%END%", format_timestamp(block.end))
         .replace("%DURATION%", format_timestamp(duration))
         .replace("%LANGUAGE%", language)
-        .replace("%SPEAKERS%", "、".join(speakers) or "未知")
+        .replace("%SPEAKERS%", _speaker_label(speakers, diarized))
         .replace("%TRANSCRIPT%", block.text)
     )
     messages = [
@@ -542,6 +591,7 @@ def global_summary(
     duration: float,
     speakers: Sequence[str],
     language: str,
+    diarized: bool = True,
 ) -> tuple[str, dict]:
     """第二阶段：局部摘要 -> 全局中文 Markdown 总结。"""
     digest = build_digest(summaries)
@@ -549,13 +599,13 @@ def global_summary(
 
     user_prompt = (
         FINAL_USER_TEMPLATE.replace("%DURATION%", format_timestamp(duration))
-        .replace("%SPEAKERS%", "、".join(speakers) or "未知")
+        .replace("%SPEAKERS%", _speaker_label(speakers, diarized))
         .replace("%LANGUAGE%", language)
         .replace("%BLOCKS%", str(len(summaries)))
         .replace("%DIGEST%", digest)
     )
     messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "system", "content": SYSTEM_PROMPT if diarized else SINGLE_SPEAKER_SYSTEM_PROMPT},
         {"role": "user", "content": user_prompt},
     ]
     content, usage = _chat(
@@ -564,13 +614,25 @@ def global_summary(
         purpose="final-summary",
     )
     markdown = _strip_code_fence(content)
-    markdown = _postprocess_markdown(markdown, duration=duration, speakers=speakers, language=language)
+    markdown = _postprocess_markdown(
+        markdown, duration=duration, speakers=speakers, language=language, diarized=diarized
+    )
     return markdown, usage
 
 
-def _postprocess_markdown(markdown: str, *, duration: float, speakers: Sequence[str], language: str) -> str:
+def _postprocess_markdown(
+    markdown: str,
+    *,
+    duration: float,
+    speakers: Sequence[str],
+    language: str,
+    diarized: bool = True,
+) -> str:
     """补齐头部元信息，保证输出一定有「一级标题 + 元信息行」，即使模型漏写。"""
-    meta = f"> 时长 {format_timestamp(duration)} ｜ 说话人 {len(speakers)} 位 ｜ 检测语言 {language}"
+    if diarized:
+        meta = f"> 时长 {format_timestamp(duration)} ｜ 说话人 {len(speakers)} 位 ｜ 检测语言 {language}"
+    else:
+        meta = f"> 时长 {format_timestamp(duration)} ｜ 未做说话人分离 ｜ 检测语言 {language}"
     lines = markdown.strip().splitlines()
 
     # 只认一级标题；模型直接以 "## 一、..." 开头时补一个 H1，避免元信息插进章节中间
@@ -588,37 +650,85 @@ def _postprocess_markdown(markdown: str, *, duration: float, speakers: Sequence[
 # ---------------------------------------------------------------------------
 # 对外主入口
 # ---------------------------------------------------------------------------
-def _extract_segments(payload: Any) -> tuple[list[dict], dict]:
-    """兼容两种输入：第三步的完整 dict（含 segments）或直接一个 segment 列表。"""
-    if isinstance(payload, dict):
-        segments = payload.get("segments") or []
-        meta = {
-            "duration": float(payload.get("duration_sec") or 0.0),
-            "language": str(payload.get("language") or "auto"),
-            "speakers": payload.get("speakers") or [],
-        }
-    elif isinstance(payload, list):
-        segments, meta = payload, {"duration": 0.0, "language": "auto", "speakers": []}
-    else:
+def normalize_payload(payload: Any) -> dict:
+    """校验并规范化转录 JSON（接口导入 / CLI / 内部调用共用同一套规则）。
+
+    容忍两种输入：完整 dict（含 segments/speakers/duration_sec），或直接一个 segment 列表。
+    :raises SummarizationError: 结构不合法或没有可用文本
+    """
+    if isinstance(payload, list):
+        payload = {"segments": payload}
+    if not isinstance(payload, dict):
         raise SummarizationError(f"不支持的转录输入类型: {type(payload)!r}")
 
-    normalized: list[dict] = [
-        {
-            "start": float(seg.get("start", 0.0)),
-            "end": float(seg.get("end", seg.get("start", 0.0))),
-            "speaker": str(seg.get("speaker") or "UNKNOWN"),
-            "text": str(seg.get("text", "")).strip(),
-        }
-        for seg in segments
-        if str(seg.get("text", "")).strip()
-    ]
-    normalized.sort(key=lambda s: s["start"])
+    raw_segments = payload.get("segments")
+    if not isinstance(raw_segments, list) or not raw_segments:
+        raise SummarizationError("转录 JSON 里没有 segments 数组，或 segments 为空")
 
-    if meta["duration"] <= 0 and normalized:
-        meta["duration"] = normalized[-1]["end"]
-    if not meta["speakers"]:
-        meta["speakers"] = _collect_speakers(normalized)
-    return normalized, meta
+    cleaned: list[dict] = []
+    for item in raw_segments:
+        if not isinstance(item, dict):
+            continue
+        text = str(item.get("text", "")).strip()
+        if not text:
+            continue
+        try:
+            start = float(item.get("start", 0.0) or 0.0)
+            end = float(item.get("end", start) or start)
+        except (TypeError, ValueError):
+            continue
+        if end < start:
+            end = start
+        cleaned.append(
+            {
+                "start": round(start, 3),
+                "end": round(end, 3),
+                "speaker": str(item.get("speaker") or "UNKNOWN"),
+                "text": text,
+            }
+        )
+
+    if not cleaned:
+        raise SummarizationError("segments 里没有任何可用的文本（text 全为空或时间戳非法）")
+    cleaned.sort(key=lambda s: s["start"])
+
+    normalized = dict(payload)
+    normalized["segments"] = cleaned
+    normalized["num_segments"] = len(cleaned)
+    if not isinstance(normalized.get("speakers"), list) or not normalized["speakers"]:
+        normalized["speakers"] = _collect_speakers(cleaned)
+    if not normalized.get("duration_sec"):
+        normalized["duration_sec"] = cleaned[-1]["end"]
+    return normalized
+
+
+def _extract_segments(payload: Any) -> tuple[list[dict], dict]:
+    """规范化输入并拆出 (segments, meta)。"""
+    payload = normalize_payload(payload)
+    segments = [
+        {
+            "start": float(seg["start"]),
+            "end": float(seg["end"]),
+            "speaker": seg["speaker"],
+            "text": seg["text"],
+        }
+        for seg in payload["segments"]
+    ]
+    speakers = payload.get("speakers") or []
+    # 只有「确实分离出了具名说话人」才按多人对话总结；
+    # 否则模型会被要求区分根本不存在的 Speaker，只能编造。
+    # 导入的 JSON 可能没有 diarized 字段，此时以 speakers 是否有具名标签为准。
+    named_speakers = any(str(name).strip().upper() not in {"", "UNKNOWN"} for name in speakers)
+    diarized = named_speakers and payload.get("diarized") is not False
+    meta = {
+        "duration": float(payload.get("duration_sec") or 0.0),
+        "language": str(payload.get("language") or "auto"),
+        "speakers": speakers,
+        "diarized": diarized,
+    }
+    if meta["duration"] <= 0 and segments:
+        meta["duration"] = segments[-1]["end"]
+    return segments, meta
 
 
 def summarize(
@@ -641,8 +751,9 @@ def summarize(
 
     blocks = build_blocks(segments, max_chars=block_chars or SUMMARY_BLOCK_CHARS)
     logger.info(
-        "开始总结：%d 段 / %d 块 / 时长 %s / 说话人 %s",
-        len(segments), len(blocks), format_timestamp(meta["duration"]), meta["speakers"] or ["UNKNOWN"],
+        "开始总结：%d 段 / %d 块 / 时长 %s / %s",
+        len(segments), len(blocks), format_timestamp(meta["duration"]),
+        f"说话人 {meta['speakers']}" if meta["diarized"] else "未做说话人分离（单人口播 prompt）",
     )
 
     summaries: list[dict] = []
@@ -654,6 +765,7 @@ def summarize(
             duration=meta["duration"],
             language=meta["language"],
             speakers=meta["speakers"],
+            diarized=meta["diarized"],
         )
         summaries.append(summary)
         for key in usage_total:
@@ -664,6 +776,7 @@ def summarize(
         duration=meta["duration"],
         speakers=meta["speakers"],
         language=meta["language"],
+        diarized=meta["diarized"],
     )
     for key in usage_total:
         usage_total[key] += final_usage.get(key, 0)
@@ -680,6 +793,7 @@ def summarize(
             "duration_ts": format_timestamp(meta["duration"]),
             "language": meta["language"],
             "speakers": meta["speakers"],
+            "diarized": meta["diarized"],
             "input_chars": sum(b.chars for b in blocks),
             "elapsed_sec": round(time.time() - started, 1),
         },
