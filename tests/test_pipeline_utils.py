@@ -677,6 +677,29 @@ def test_language_windows_low_confidence_uses_context() -> None:
     assert [(s.start, s.end, s.language) for s in spans] == [(0, 75, "en")]
 
 
+def test_language_switch_count_ignores_same_language_splits() -> None:
+    spans = [
+        transcribe.LanguageSpan(0, 50, "ja"),
+        transcribe.LanguageSpan(50, 150, "en"),
+        transcribe.LanguageSpan(150, 250, "en"),  # 同语言被长度拆开，不算切换
+        transcribe.LanguageSpan(250, 350, "ja"),
+    ]
+    assert transcribe._language_switch_count(spans) == 2
+
+
+def test_language_windows_long_span_not_split_by_default() -> None:
+    spans = transcribe.merge_language_windows(
+        [
+            transcribe.LanguageWindow(0, 50, "ja", 1.0),
+            transcribe.LanguageWindow(50, 150, "en", 1.0),
+            transcribe.LanguageWindow(150, 250, "en", 1.0),
+            transcribe.LanguageWindow(250, 350, "ja", 1.0),
+        ]
+    )
+    assert [span.language for span in spans] == ["ja", "en", "ja"]
+    assert [(span.start, span.end) for span in spans] == [(0, 50), (50, 250), (250, 350)]
+
+
 def test_language_windows_long_spans_split_only_when_mixed() -> None:
     mixed = transcribe.merge_language_windows(
         [

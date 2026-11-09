@@ -793,10 +793,10 @@ python -m app.services.summarizer ./demo.json --out ./summary.md
 | `ASR_LANG_LOCK` | `0` | `1`=恢复旧行为：某语言占比达标后锁定并强制后续切片单语（多语种采访不建议开启） |
 | `ASR_LANG_SPAN` | `1` | 片内语言细分开关。滑窗检测语言，在变化处把切片再切成子片，子片各自解码/对齐 |
 | `ASR_LANG_PROBE_SEC` | `25` | 语言探测窗口（秒）。太短边界模糊，太长会跨语种 |
-| `ASR_LANG_SPAN_MAX` / `ASR_LANG_SPAN_MIN` | `90` / `8` | 单个语言子片的上下限（秒） |
+| `ASR_LANG_SPAN_MAX` / `ASR_LANG_SPAN_MIN` | `300` / `8` | 单个语言子片的上下限（秒）；同语言连续语音不会因为长而被拆得太碎 |
 | `ASR_LANG_MIN_CONF` | `0.55` | `detect_language` 置信度下限，低于它交给上下文推断/whisper 自己判断 |
 | `ASR_LANG_SNAP_WINDOW` / `ASR_LANG_MIN_CHUNK_SEC` | `6` / `45` | 子片边界吸附静音的半径；切片短于该值不做细分 |
-| `ASR_LANG_MAX_PARTS` | `6` | 单切片最多切出多少语言子片；超过说明是 BGM/噪声导致检测抖动，退回整片 |
+| `ASR_LANG_MAX_PARTS` | `6` | 单切片允许的语言切换次数；超过说明是 BGM/噪声导致检测抖动，退回整片（同语言被长度拆分不计入） |
 | `ASR_OVERLAP` | `1` | 重叠语音标注开关。开启后重叠段带 `speakers=[...]` 与 `overlap=true` |
 | `ASR_OVERLAP_MIN_RATIO` | `0.3` | 某说话人覆盖 segment 时长达该比例才算「同时说话」；0.15 会把换人瞬间也标成重叠 |
 | `DIARIZATION_MODEL` | `pyannote/speaker-diarization-3.1` | 需 Agree 的模型见 [模型授权](#模型授权必读) |

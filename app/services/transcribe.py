@@ -178,8 +178,9 @@ LANG_SPAN_ENABLED = (os.getenv("ASR_LANG_SPAN", "1") or "1").strip().lower() not
 }
 # 语言探测窗口：25s 足够 whisper 判断语种，又不会把边界模糊掉
 LANG_PROBE_SEC = max(8.0, float(os.getenv("ASR_LANG_PROBE_SEC", "25")))
-# 单个语言子片的上限：太长会重新引入「片内跨语种」，太短则上下文不足
-LANG_SPAN_MAX_SEC = max(30.0, float(os.getenv("ASR_LANG_SPAN_MAX", "90")))
+# 单个语言子片的上限。同一语言的 200~300s 连续语音不需要拆：
+# whisper 内部本来就按 30s 窗口解码，拆太碎只会增加切点与调用次数。
+LANG_SPAN_MAX_SEC = max(30.0, float(os.getenv("ASR_LANG_SPAN_MAX", "300")))
 # 短于该值的同语种子片并入邻居，避免把一句寒暄切成独立子片
 LANG_SPAN_MIN_SEC = max(2.0, float(os.getenv("ASR_LANG_SPAN_MIN", "8")))
 # detect_language 的置信度下限：低于它视为「本窗口语言不可信」，交给上下文推断
@@ -820,6 +821,11 @@ def _speaker_stats(
 # ---------------------------------------------------------------------------
 # 片内语言细分（纯规划逻辑 + 音频切片）
 # ---------------------------------------------------------------------------
+def _language_switch_count(spans: Sequence[LanguageSpan]) -> int:
+    """相邻子片的语言切换次数（同语言被长度拆分不算切换）。"""
+    return sum(1 for prev, cur in zip(spans, spans[1:]) if prev.language != cur.language)
+
+
 def merge_language_windows(
     windows: Sequence[LanguageWindow],
     max_span_sec: float = LANG_SPAN_MAX_SEC,
@@ -1197,11 +1203,14 @@ def plan_language_spans(
                 confidence,
             )
         ]
-    if len(spans) > LANG_SPAN_MAX_PARTS:
+    # 抖动判断必须看「语言切换次数」，不能看子片数：
+    # 同一种语言被 max_span 拆成多段是正常现象，不是检测抖动。
+    switches = _language_switch_count(spans)
+    if switches >= LANG_SPAN_MAX_PARTS:
         # BGM / 噪声会让检测结果来回跳；细分反而把一片音乐切成多种语言去解码
         logger.warning(
-            "切片 %d 语言检测抖动（%d 个子片，语言 %s），退回整片转录",
-            chunk.index, len(spans), [span.language for span in spans],
+            "切片 %d 语言检测抖动（%d 次语言切换，语言 %s），退回整片转录",
+            chunk.index, switches, [span.language for span in spans],
         )
         return [whole]
 
