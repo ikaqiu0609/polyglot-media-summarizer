@@ -25,7 +25,6 @@
 - [配置项](#配置项)
 - [性能与显存](#性能与显存)
 - [常见问题](#常见问题)
-- [隐私与安全](#隐私与安全)
 - [已知限制](#已知限制)
 
 ---
@@ -830,29 +829,6 @@ python -m app.services.summarizer ./demo.json --out ./summary.md
 - 4~6GB 档位若必须开启说话人分离，可先设 `ASR_ALIGN=0` 省约 1.2GB；仍 OOM 再关 `ENABLE_DIARIZATION`。
 - 纯 CPU 可运行（`ASR_DEVICE=cpu` + `int8`），但转录与分离会慢一个数量级。
 
-### 如何确认档位与峰值
-
-```bat
-nvidia-smi --query-gpu=name,memory.total --format=csv
-```
-
-任务日志会打印两行：
-
-```
-分离阶段显存峰值 1630 MB
-转录峰值显存 5217 MB
-```
-
-`transcript.json` 的 `peak_vram_mb` 是转录阶段峰值。两者都是 PyTorch allocator 口径，`nvidia-smi` 会再高 0.5~1GB（CUDA 上下文、桌面占用等）。
-
-### 实测参考
-
-RTX 4070 8GB + `medium` + `int8_float16` + `batch_size=4`：84 分钟素材（含 20 分钟静音），分离约 4 分钟、转录约 5 分钟，`nvidia-smi` 峰值约 4.2GB。不同显卡按上表与模型速度比例浮动。
-
-### 成本
-
-总结成本由 `SUMMARY_BLOCK_CHARS` 决定，1 小时内容约 4~8 次 Map + 1 次 Reduce；每次调用的 token 数会写进 `/status` 的 `result.tokens`。
-
 ---
 
 ## 常见问题
@@ -984,16 +960,6 @@ ASR_LANGUAGE=ko
 
 ---
 
-## 隐私与安全
-
-- **音频不出本机**：ASR 与说话人分离全部在本机 GPU 上完成，不调用任何第三方 ASR 服务；断网也能转录（只有首次下载权重需要联网）。
-- **只有文本出网**：发往 DeepSeek 的是分段后的转录文本，不含原始音视频。若内容敏感，可把 `DEEPSEEK_BASE_URL` 指向自建兼容网关。
-- **密钥只走环境变量 / `.env`**：代码中无任何硬编码 Token；`.gitignore` 已排除 `.env`，`.env.example` 里只有占位符。
-- **上传防护**：文件名剥离路径（防目录穿越）、扩展名白名单、体积上限、流式落盘。
-- **日志**：不打印 Token；错误信息会截断到 2000 字符并回传 `/status`。
-
----
-
 ## 已知限制
 
 1. 任务状态为单进程内存态，不支持多 worker / 多副本（启动时会从 `data/outputs` 与 `data/uploads` 恢复历史任务，但运行中的任务无法迁移）。
@@ -1003,6 +969,4 @@ ASR_LANGUAGE=ko
 5. 同一段 30s 内两人抢话时，说话人切分会有抖动（已做孤词平滑，但不保证完全准确）。
 6. 说话人分离失败（授权缺失、显存不足等）时会自动降级为无标签转录。总结按三态处理：有标签走多人 prompt；做了分离但失败走「多人对话未分离」prompt；只有明确没请求分离时才按单人口播处理。
 
----
 
-**后续可扩展方向**：转录结果人工校对界面、任务持久化（Redis + Celery）、字幕导出（SRT/VTT）。
