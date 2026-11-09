@@ -256,6 +256,7 @@ def _summary_result(
         # 片内语言细分结果与重叠语音统计（便于排查多语种识别）
         "language_spans": transcribed.get("language_spans", []),
         "overlap_segments": transcribed.get("overlap_segments", 0),
+        "separated_segments": transcribed.get("separated_segments", 0),
         "diarized": bool(summary["meta"].get("diarized")),
         "speaker_mode": summary["meta"].get("speaker_mode"),
         "diarization": transcribed.get("diarization"),
@@ -280,6 +281,7 @@ def _transcribed_result(
         "language": transcribed.get("language"),
         "language_spans": transcribed.get("language_spans", []),
         "overlap_segments": transcribed.get("overlap_segments", 0),
+        "separated_segments": transcribed.get("separated_segments", 0),
         "diarized": bool(transcribed.get("diarized")),
         "diarization": transcribed.get("diarization"),
         "audio_duration_sec": total_audio,
@@ -388,6 +390,7 @@ def run_pipeline(task_id: str, speaker_count: int | None = None) -> None:
             progress=_progress_bridge(task_id, TaskStatus.TRANSCRIBING),
             min_speakers=speaker_count,
             max_speakers=speaker_count,
+            separation_settings=settings,
         )
         # 落盘时带上来源信息：进程重启后靠它把 outputs 里的产物还原成任务
         payload = dict(transcribed)
@@ -731,6 +734,18 @@ async def lifespan(_: FastAPI):
             logger.warning(
                 "DIAR_AUDIO_INPUT=path 但 torchcodec 不可用，分离会失败；"
                 "改回 waveform 或按 README 安装与 torch 版本匹配的 torchcodec"
+            )
+    if settings.separation_enabled:
+        if not Path(settings.separation_python).exists():
+            logger.warning(
+                "SEPARATION_ENABLED=1 但找不到分离环境：%s；"
+                "先运行 scripts/setup-separation-env.bat，本任务会跳过分离",
+                settings.separation_python,
+            )
+        else:
+            logger.info(
+                "重叠语音分离已启用（模型 %s，独立环境 %s）",
+                settings.separation_model, settings.separation_python,
             )
     if not settings.deepseek_key_present:
         logger.warning("未检测到 DEEPSEEK_API_KEY，手动总结会失败")

@@ -39,6 +39,7 @@ import json
 import logging
 import math
 import os
+import re
 import time
 import warnings
 from collections import Counter
@@ -48,6 +49,7 @@ from typing import Any, Callable, Sequence
 
 import torch
 
+from app.services import separation as separation_service
 from app.services.audio import (
     AudioChunk,
     SAMPLE_RATE,
@@ -153,6 +155,11 @@ HALLU_COMPRESSION_RATIO = float(os.getenv("HALLU_COMPRESSION_RATIO", "2.4"))
 HALLU_REPEAT_NGRAM = max(3, int(os.getenv("HALLU_REPEAT_NGRAM", "6")))
 HALLU_REPEAT_COUNT = max(2, int(os.getenv("HALLU_REPEAT_COUNT", "5")))
 HALLU_REPEAT_MIN_CHARS = max(20, int(os.getenv("HALLU_REPEAT_MIN_CHARS", "80")))
+# 粘连文本（BGM/音效/重叠语音段整句没有词边界）：截断保留前半；
+# 整段粘连时保留原文并标 low_quality，由总结阶段跳过，不再直接删除。
+HALLU_GLUED = (os.getenv("HALLU_GLUED", "1") or "1").strip().lower() not in {
+    "0", "false", "no", "off",
+}
 
 # 前 N 个「有语音」的切片各投一票决定全局语言，之后固定传给所有切片。
 # 逐片 auto 检测会让同一文件的语言来回跳（例如前 20 分钟被判成 en、之后是 ko）。
@@ -1393,19 +1400,45 @@ def _truncate_at_repeat(text: str, n: int, count: int) -> str:
     return text[: index[cut]].strip()
 
 
+# 连续拉丁字母（允许内部有 ' 和 -）超过该长度，几乎不可能是真实英文单词：
+# 日常文本里 26+ 的连续串基本都是 BGM/音效/重叠语音把整句黏成一坨。
+_GLUED_LATIN_RE = re.compile(r"[A-Za-z][A-Za-z'\-]{25,}")
+
+
+def _glued_latin_cut(text: str) -> int | None:
+    """返回第一个「超长无空格拉丁串」的起点；没有则返回 None。
+
+    BGM / 重叠语音段 whisper 会输出 `againandagainsothosearethemechanics...`
+    或 `realquicksothecurseshacklewill-o-wisps...` 这类没有词边界的文本。
+    """
+    latin = sum(1 for ch in text if ch.isascii() and ch.isalpha())
+    if latin < 40:
+        return None
+    non_latin = sum(1 for ch in text if ch.isalpha() and not ch.isascii())
+    if latin / max(1, latin + non_latin) < 0.85:
+        return None  # 中日韩文本没有空格，不能用这个规则
+    match = _GLUED_LATIN_RE.search(text)
+    return match.start() if match else None
+
+
 def _filter_hallucinations(segments: list[dict], label: str = "") -> list[dict]:
     """过滤 Whisper 在 BGM / 静音处的典型幻觉。
 
-    四类规则（阈值均可用环境变量覆盖）：
+    五类规则（阈值均可用环境变量覆盖）：
         1. compression_ratio 过高 —— 重复输出；
         2. no_speech_prob 高且 avg_logprob 低 —— 这段其实没人说话；
         3. 与上一段归一化后完全相同 —— 连续重复字幕；
-        4. 段内 n-gram 复读 —— 不依赖库字段，专治「Xについては」式循环。
+        4. 段内 n-gram 复读 —— 不依赖库字段，专治「Xについては」式循环；
+        5. 超长无空格拉丁串 —— BGM/重叠语音段把整句黏成 `againandagain...`。
+           前半正常就截断保留；整段粘连则保留原文并标 low_quality（不删除）。
            命中时先截断保留前半段，只有截断后不足 6 个有效字符才整段丢弃。
     少于 6 个有效字符的重复（例如「はい」「OK」）不算幻觉，避免误杀。
     """
     kept: list[dict] = []
-    dropped = {"compression": 0, "no_speech": 0, "duplicate": 0, "repeat": 0, "truncated": 0}
+    dropped = {
+        "compression": 0, "no_speech": 0, "duplicate": 0,
+        "repeat": 0, "truncated": 0, "glued": 0,
+    }
     previous = ""
 
     for seg in segments:
@@ -1428,6 +1461,29 @@ def _filter_hallucinations(segments: list[dict], label: str = "") -> list[dict]:
             continue
 
         normalized = _norm_text(text)
+        glued_cut = _glued_latin_cut(text) if HALLU_GLUED else None
+        if glued_cut is not None:
+            if glued_cut >= 20:
+                # 前半正常、后半粘连：截断保留前半
+                prefix = text[:glued_cut].strip()
+                logger.info(
+                    "%s粘连文本截断：%d 字 -> %d 字",
+                    f"[{label}] " if label else "",
+                    len(text), len(prefix),
+                )
+                dropped["truncated"] += 1
+                seg = dict(seg)
+                seg["text"] = prefix
+                text = prefix
+                normalized = _norm_text(text)
+            else:
+                # 整段粘连（多为重叠语音）：保留原文，标记低质量，总结阶段跳过
+                dropped["glued"] += 1
+                seg = dict(seg)
+                seg["low_quality"] = True
+                kept.append(seg)
+                continue
+
         if (
             len(normalized) >= HALLU_REPEAT_MIN_CHARS
             and _max_ngram_repeat(normalized, HALLU_REPEAT_NGRAM) >= HALLU_REPEAT_COUNT
@@ -1758,6 +1814,91 @@ def _is_cjk(ch: str) -> bool:
     )
 
 
+def _overlaps_span(seg: dict, start: float, end: float, ratio: float = 0.5) -> bool:
+    """segment 是否与给定区间有足够重叠（默认 50%）。"""
+    seg_start = float(seg.get("start", 0.0))
+    seg_end = float(seg.get("end", seg_start))
+    overlap = _overlap(seg_start, seg_end, start, end)
+    if overlap <= 0:
+        return False
+    shorter = min(max(seg_end - seg_start, 0.0), max(end - start, 0.0))
+    return shorter <= 0 or overlap / shorter >= ratio
+
+
+def replace_overlaps_with_separated(
+    segments: list[dict],
+    turns: Sequence[DiarTurn],
+    source_wav: Path,
+    work_dir: Path,
+    model: Any,
+    sep_settings: Any,
+) -> tuple[list[dict], Any]:
+    """对重叠区间做声源分离 + 逐轨 ASR，并用结果替换原 segments。
+
+    前置条件：调用方在分离子进程启动前释放 ASR 模型（8GB 卡放不下两套模型）。
+    返回 (segments, model)；model 可能在本函数内被重新加载。
+    任何一步失败都保留原结果，不阻塞主流程。
+    """
+    from app.services import separation as sep  # noqa: PLC0415 延迟导入
+
+    overlaps = sep.overlap_spans(
+        turns,
+        min_sec=float(getattr(sep_settings, "separation_min_overlap_sec", 0.8)),
+    )
+    if not overlaps:
+        logger.info("未检测到需要分离的重叠区间")
+        return segments, model
+
+    max_clip = float(getattr(sep_settings, "separation_max_clip_sec", 60.0))
+    replaced: list[dict] = []
+    for index, (start, end) in enumerate(overlaps):
+        cursor = start
+        while cursor < end - 0.3:
+            clip_end = min(end, cursor + max_clip)
+            out_dir = work_dir / f"sep_{index:02d}_{int(round(cursor))}"
+            manifest = sep.separate(source_wav, cursor, clip_end, out_dir, sep_settings)
+            if manifest is None:
+                cursor = clip_end
+                continue
+            if model is None:
+                model = load_asr_model()
+
+            for track in manifest.get("tracks") or []:
+                track_file = Path(manifest.get("out_dir", out_dir)) / str(track.get("file", ""))
+                if not track_file.exists():
+                    continue
+                try:
+                    result = _transcribe_chunk(model, track_file, BATCH_SIZE, None)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("分离轨转录失败（%s）：%s", track.get("speaker"), exc)
+                    continue
+                track_segments = _filter_hallucinations(
+                    [dict(s) for s in (result.get("segments") or [])],
+                    label=f"分离轨 {track.get('speaker', '?')}",
+                )
+                _offset_segments(track_segments, cursor)
+                for seg in track_segments:
+                    seg["speaker"] = str(track.get("speaker") or "UNKNOWN")
+                    seg["separated"] = True
+                    seg["overlap"] = True
+                replaced.extend(track_segments)
+            cursor = clip_end
+
+    if not replaced:
+        logger.warning("重叠区间分离没有产出可用文本，保留原转录结果")
+        return segments, model
+
+    kept = [
+        seg for seg in segments
+        if not any(_overlaps_span(seg, start, end) for start, end in overlaps)
+    ]
+    logger.info(
+        "重叠段分离替换：原 %d 段 -> 保留 %d 段 + 分离 %d 段（%d 个重叠区间）",
+        len(segments), len(kept), len(replaced), len(overlaps),
+    )
+    return kept + replaced, model
+
+
 def postprocess_segments(
     segments: list[dict],
     gap_sec: float = MERGE_GAP_SEC,
@@ -1780,6 +1921,8 @@ def postprocess_segments(
             # 重叠语音：保留多说话人与标记，合并时不能被抹掉
             "speakers": list(s.get("speakers") or []),
             "overlap": bool(s.get("overlap")),
+            "separated": bool(s.get("separated")),
+            "low_quality": bool(s.get("low_quality")),
         }
         for s in segments
     ]
@@ -1807,6 +1950,10 @@ def postprocess_segments(
         if not seg["speakers"]:
             seg.pop("speakers", None)
             seg.pop("overlap", None)
+        if not seg.get("separated"):
+            seg.pop("separated", None)
+        if not seg.get("low_quality"):
+            seg.pop("low_quality", None)
 
     logger.debug("后处理：%d 段 -> %d 段", len(cleaned), len(merged))
     return merged
@@ -1847,6 +1994,7 @@ def transcribe_task(
     progress: Callable[[str, float, str], None] | None = None,
     min_speakers: int | None = None,
     max_speakers: int | None = None,
+    separation_settings: Any = None,
 ) -> dict:
     """切片列表 -> 带全局时间戳与说话人的 segment 列表。
 
@@ -1857,6 +2005,8 @@ def transcribe_task(
     :param progress:    进度回调 (stage, fraction 0~1, detail)，用于 /status 实时反馈
     :param min_speakers: 已知人数时传入，显著提升分离准确率（覆盖 DIAR_MIN/MAX_SPEAKERS）
     :param max_speakers: 同上
+    :param separation_settings: 传入 Settings 且 SEPARATION_ENABLED=1 时，
+        对重叠区间做声源分离（独立 pyannote 3.3.2 环境），逐轨再转录。
     :return: {"language", "language_spans", "segments": [{start,end,speaker,speakers,text}],
               "speakers", "overlap_segments", ...}
     """
@@ -2086,6 +2236,37 @@ def transcribe_task(
                 ],
             )
 
+        # ---- 3. 重叠语音分离（可选，失败自动回退）----
+        if (
+            separation_settings is not None
+            and getattr(separation_settings, "separation_enabled", False)
+            and turns
+        ):
+            if not separation_service.available(separation_settings):
+                logger.info(
+                    "SEPARATION_ENABLED=1 但分离环境未就绪（%s），本次跳过；"
+                    "运行 scripts/setup-separation-env.bat 可启用",
+                    getattr(separation_settings, "separation_python", "?"),
+                )
+            else:
+                report("transcribing", 1.0, "检测到重叠语音，正在分离")
+                if (
+                    getattr(separation_settings, "separation_release_asr", True)
+                    and model is not None
+                ):
+                    del model
+                    model = None
+                    free_cuda_memory()
+                    logger.info("已释放 ASR 模型，为分离子进程腾出显存")
+                collected, model = replace_overlaps_with_separated(
+                    collected,
+                    turns,
+                    source_wav,
+                    source_wav.parent,
+                    model,
+                    separation_settings,
+                )
+
         report("transcribing", 1.0, "转录与对齐完成，开始后处理")
         diarized = bool(turns)
         gap_sec = MERGE_GAP_SEC if diarized else MERGE_GAP_SEC_NO_DIAR
@@ -2126,6 +2307,7 @@ def transcribe_task(
                 )
 
         overlap_segments = sum(1 for seg in segments if seg.get("overlap"))
+        separated_segments = sum(1 for seg in segments if seg.get("separated"))
         result_payload = {
             "language": language_out,
             "chunk_languages": detected_languages,
@@ -2138,6 +2320,15 @@ def transcribe_task(
             "num_segments": len(segments),
             # 多人同时说话：这些段带 speakers 列表与 overlap=true，文本本身无法拆开
             "overlap_segments": overlap_segments,
+            # 其中有多少段是「分离后逐轨重新转录」的（separated=true）
+            "separated_segments": separated_segments,
+            "separation": {
+                "enabled": bool(
+                    separation_settings is not None
+                    and getattr(separation_settings, "separation_enabled", False)
+                ),
+                "model": getattr(separation_settings, "separation_model", None),
+            },
             "duration_sec": total_duration,
             "diarized": bool(turns),
             # 分离为什么没成功：写进产物，UI/总结不必再翻日志
@@ -2194,6 +2385,7 @@ def transcribe_file(
     cleanup_audio: bool = False,
     min_speakers: int | None = None,
     max_speakers: int | None = None,
+    separation_settings: Any = None,
 ) -> dict:
     """端到端便利函数：媒体文件 -> 转录结果（内部先调 audio.analyze）。"""
     chunks = analyze(media_path, chunk_minutes=chunk_minutes)
@@ -2204,6 +2396,7 @@ def transcribe_file(
             do_diarize=do_diarize,
             min_speakers=min_speakers,
             max_speakers=max_speakers,
+            separation_settings=separation_settings,
         )
     finally:
         if cleanup_audio:

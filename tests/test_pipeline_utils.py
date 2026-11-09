@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import sys
 import tempfile
+import types
 import wave
 from pathlib import Path
 
@@ -16,7 +17,7 @@ if str(ROOT) not in sys.path:  # 允许直接 python tests/test_pipeline_utils.p
 
 import torch  # noqa: E402
 
-from app.services import audio, summarizer, transcribe  # noqa: E402
+from app.services import audio, separation, summarizer, transcribe  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -871,6 +872,152 @@ def test_filter_hallucinations_truncates_partial_repeat() -> None:
     assert len(kept) == 1
     assert kept[0]["text"].startswith("This is a normal sentence")
     assert "については" not in kept[0]["text"]
+
+
+# ---------------------------------------------------------------------------
+# 粘连文本 / 重叠语音分离
+# ---------------------------------------------------------------------------
+def test_glued_latin_truncated_keeps_prefix() -> None:
+    text = (
+        "I guess they don't want you to have a single turn forever with gazillion damage. "
+        "Maybe that's the thing. and cursed shackles as we just talked about "
+        "againandagainsothosearethemechanicsandeffectssocardtimegotalittlepeekonthosecards"
+    )
+    kept = transcribe._filter_hallucinations([{"text": text}])
+    assert len(kept) == 1
+    assert kept[0]["text"].endswith("as we just talked about")
+    assert "againandagain" not in kept[0]["text"]
+
+
+def test_glued_latin_marks_fully_glued_segment() -> None:
+    text = (
+        "realquicksothecurseshacklewill-o-wispsdon'tit'sjustanyattackcardso"
+        "itcouldalsoberenoaaswellrightwiththebulletsifyou"
+    )
+    kept = transcribe._filter_hallucinations([{"text": text}])
+    assert len(kept) == 1
+    assert kept[0]["low_quality"] is True
+
+
+def test_glued_latin_keeps_normal_english() -> None:
+    text = (
+        "Yeah, I hope so, too. And I do have to say, unlike the last time "
+        "where I was piggybacked with gameplay, this one is different."
+    )
+    kept = transcribe._filter_hallucinations([{"text": text}])
+    assert len(kept) == 1
+    assert kept[0]["text"] == text
+
+
+def test_overlap_spans_detects_simultaneous_speech() -> None:
+    turns = [
+        transcribe.DiarTurn(0.0, 5.0, "A"),
+        transcribe.DiarTurn(3.0, 8.0, "B"),
+        transcribe.DiarTurn(10.0, 12.0, "A"),
+    ]
+    assert separation.overlap_spans(turns, min_sec=0.5, join_gap=0.5) == [(3.0, 5.0)]
+
+
+def test_overlap_spans_ignores_adjacent_turns() -> None:
+    turns = [
+        transcribe.DiarTurn(0.0, 5.0, "A"),
+        transcribe.DiarTurn(5.0, 10.0, "B"),
+    ]
+    assert separation.overlap_spans(turns) == []
+
+
+def test_overlap_spans_merges_close_clips_and_filters_short() -> None:
+    turns = [
+        transcribe.DiarTurn(0.0, 5.0, "A"),
+        transcribe.DiarTurn(4.0, 5.2, "B"),
+        transcribe.DiarTurn(5.3, 9.0, "A"),
+        transcribe.DiarTurn(5.2, 9.0, "B"),
+    ]
+    assert separation.overlap_spans(turns, min_sec=0.5, join_gap=1.0) == [(4.0, 9.0)]
+    assert separation.overlap_spans(turns, min_sec=0.5, join_gap=0.0) == [
+        (4.0, 5.0),
+        (5.3, 9.0),
+    ]
+
+
+def test_overlaps_span_requires_half_coverage() -> None:
+    seg = {"start": 4.0, "end": 6.0}
+    assert transcribe._overlaps_span(seg, 5.0, 9.0) is True
+    assert transcribe._overlaps_span(seg, 5.5, 9.0) is False
+
+
+def test_replace_overlaps_with_separated() -> None:
+    turns = [
+        transcribe.DiarTurn(0.0, 5.0, "SPEAKER_00"),
+        transcribe.DiarTurn(2.0, 5.0, "SPEAKER_01"),
+    ]
+    original = [{"start": 0.0, "end": 5.0, "speaker": "SPEAKER_00", "text": "old glued text"}]
+    settings = types.SimpleNamespace(
+        separation_enabled=True,
+        separation_min_overlap_sec=0.8,
+        separation_max_clip_sec=60.0,
+    )
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        (tmp_path / "track_00.wav").write_bytes(b"fake")
+        manifest = {
+            "out_dir": str(tmp_path),
+            "tracks": [{"speaker": "SPEAKER_01", "file": "track_00.wav", "rms": 0.1}],
+        }
+        originals = (
+            separation.separate,
+            transcribe.load_asr_model,
+            transcribe._transcribe_chunk,
+        )
+        try:
+            separation.separate = lambda *a, **k: manifest
+            transcribe.load_asr_model = lambda *a, **k: object()
+            transcribe._transcribe_chunk = lambda *a, **k: {
+                "segments": [{"start": 0.5, "end": 2.0, "text": "new separated text"}]
+            }
+            out, model = transcribe.replace_overlaps_with_separated(
+                original, turns, tmp_path / "source.wav", tmp_path, None, settings
+            )
+        finally:
+            (
+                separation.separate,
+                transcribe.load_asr_model,
+                transcribe._transcribe_chunk,
+            ) = originals
+
+    assert len(out) == 1
+    assert out[0]["text"] == "new separated text"
+    assert out[0]["speaker"] == "SPEAKER_01"
+    assert out[0]["start"] == 2.5 and out[0]["end"] == 4.0
+    assert out[0]["separated"] is True
+    assert out[0]["overlap"] is True
+    assert model is not None
+
+
+def test_replace_overlaps_falls_back_when_separation_fails() -> None:
+    turns = [
+        transcribe.DiarTurn(0.0, 5.0, "SPEAKER_00"),
+        transcribe.DiarTurn(2.0, 5.0, "SPEAKER_01"),
+    ]
+    original = [{"start": 0.0, "end": 5.0, "speaker": "SPEAKER_00", "text": "old"}]
+    settings = types.SimpleNamespace(
+        separation_enabled=True,
+        separation_min_overlap_sec=0.8,
+        separation_max_clip_sec=60.0,
+    )
+    previous = separation.separate
+    try:
+        separation.separate = lambda *a, **k: None
+        with tempfile.TemporaryDirectory() as tmp:
+            out, model = transcribe.replace_overlaps_with_separated(
+                original, turns, Path(tmp) / "source.wav", Path(tmp), None, settings
+            )
+    finally:
+        separation.separate = previous
+
+    assert out == original
+    assert model is None
 
 
 if __name__ == "__main__":

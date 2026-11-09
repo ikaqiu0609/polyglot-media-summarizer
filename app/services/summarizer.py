@@ -443,6 +443,9 @@ def build_blocks(segments: Sequence[dict], max_chars: int = SUMMARY_BLOCK_CHARS)
         text = str(seg.get("text", "")).strip()
         if not text:
             continue
+        # 粘连/重叠段（多为无词边界的乱码）：保留在 transcript，但不喂给总结模型
+        if seg.get("low_quality"):
+            continue
         line = format_segment(seg)
         start = float(seg.get("start", 0.0))
         end = float(seg.get("end", start))
@@ -776,6 +779,9 @@ def normalize_payload(payload: Any) -> dict:
             if len(names) > 1:
                 entry["speakers"] = names
                 entry["overlap"] = bool(item.get("overlap", True))
+        # 粘连/重叠段：保留标记，总结阶段会跳过这些段，避免乱码污染 prompt
+        if item.get("low_quality"):
+            entry["low_quality"] = True
         cleaned.append(entry)
 
     if not cleaned:
@@ -808,6 +814,8 @@ def _extract_segments(payload: Any) -> tuple[list[dict], dict]:
             item["speakers"] = list(seg["speakers"])
         if seg.get("overlap"):
             item["overlap"] = True
+        if seg.get("low_quality"):
+            item["low_quality"] = True
         segments.append(item)
     speakers = payload.get("speakers") or []
     # 只有「确实分离出了具名说话人」才按多人对话总结；

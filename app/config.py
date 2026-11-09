@@ -151,6 +151,15 @@ class Settings:
     hf_token_present: bool
     deepseek_key_present: bool
 
+    # 重叠语音分离（独立 pyannote.audio 3.3.2 环境；不配置则自动跳过）
+    separation_enabled: bool
+    separation_python: str
+    separation_model: str
+    separation_timeout: int
+    separation_min_overlap_sec: float
+    separation_max_clip_sec: float
+    separation_release_asr: bool
+
     # ---------------- 派生属性 ----------------
     @property
     def max_upload_bytes(self) -> int:
@@ -197,11 +206,20 @@ class Settings:
             "deepseek_model": self.deepseek_model,
             "hf_token_present": self.hf_token_present,
             "deepseek_key_present": self.deepseek_key_present,
+            "separation": {
+                "enabled": self.separation_enabled,
+                "python": self.separation_python,
+                "model": self.separation_model,
+                "python_present": Path(self.separation_python).exists(),
+            },
         }
 
     @classmethod
     def from_env(cls) -> "Settings":
         data_root = _env_path("DATA_ROOT", PROJECT_ROOT / "data")
+        default_sep_python = PROJECT_ROOT / ".venv-sep" / (
+            "Scripts/python.exe" if os.name == "nt" else "bin/python"
+        )
         return cls(
             project_root=PROJECT_ROOT,
             data_root=data_root,
@@ -227,6 +245,15 @@ class Settings:
             deepseek_model=_env("DEEPSEEK_MODEL", "deepseek-chat") or "deepseek-chat",
             hf_token_present=bool(_env("HF_TOKEN") or _env("HUGGINGFACE_TOKEN") or _env("HF_HUB_TOKEN")),
             deepseek_key_present=bool(_env("DEEPSEEK_API_KEY")),
+            # 默认开启：环境没装好时 available() 会返回 False，任务自动跳过，不会阻塞
+            separation_enabled=_env_bool("SEPARATION_ENABLED", True),
+            separation_python=str(_env_path("SEPARATION_PYTHON", default_sep_python)),
+            separation_model=_env("SEPARATION_MODEL", "pyannote/speech-separation-ami-1.0")
+            or "pyannote/speech-separation-ami-1.0",
+            separation_timeout=max(30, _env_int("SEPARATION_TIMEOUT", 600)),
+            separation_min_overlap_sec=max(0.2, _env_float("SEPARATION_MIN_OVERLAP_SEC", 0.8)),
+            separation_max_clip_sec=max(4.0, _env_float("SEPARATION_MAX_CLIP_SEC", 60.0)),
+            separation_release_asr=_env_bool("SEPARATION_RELEASE_ASR", True),
         )
 
 

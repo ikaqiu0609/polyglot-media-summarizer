@@ -701,12 +701,18 @@ data/
   "segments": [
     {"start": 12.34, "end": 18.9, "speaker": "Speaker 1", "text": "..."},
     {"start": 1261.8, "end": 1276.1, "speaker": "Speaker 1",
-     "speakers": ["Speaker 1", "Speaker 2"], "overlap": true, "text": "..."}
+     "speakers": ["Speaker 1", "Speaker 2"], "overlap": true, "text": "..."},
+    {"start": 1567.9, "end": 1572.4, "speaker": "Speaker 4", "separated": true,
+     "overlap": true, "text": "real quick, so the curse shackle..."},
+    {"start": 1600.0, "end": 1604.0, "speaker": "Speaker 2", "low_quality": true,
+     "text": "againandagainsothosearethemechanics..."}
   ],
   "speakers": ["Speaker 1", "Speaker 2"],
   "speaker_stats": [{"speaker": "Speaker 1", "seconds": 320.5, "turns": 42}],
   "num_segments": 128,
   "overlap_segments": 3,
+  "separated_segments": 2,
+  "separation": {"enabled": true, "model": "pyannote/speech-separation-ami-1.0"},
   "duration_sec": 3721.5,
   "diarized": true,
   "diarization": {"requested": true, "ok": true, "input_mode": "waveform", "reason": null},
@@ -808,6 +814,11 @@ python -m app.services.summarizer ./demo.json --out ./summary.md
 | `DIAR_MIN_SPEAKER_SEC` / `DIAR_MIN_SPEAKER_SHARE` | `5` / `0.01` | 低于该时长的短时说话人并入最近的保留说话人；占比按有效语音时长计算 |
 | `MAX_SPEAKER_ATTACH_GAP` | `2.0` | segment 与最近说话人时间片超过该间隔就标 `UNKNOWN` |
 | `DIAR_CACHE_FAILURE` | `1` | 只缓存永久性失败（403/token）；临时错误（OOM/网络）下个任务重试。`0`=完全不缓存 |
+| `SEPARATION_ENABLED` | `1` | 重叠语音分离开关。默认开启；环境未就绪时任务自动跳过，不会阻塞 |
+| `SEPARATION_PYTHON` | `.venv-sep/.../python.exe` | 独立 pyannote.audio 3.3.2 环境的解释器路径 |
+| `SEPARATION_MODEL` | `pyannote/speech-separation-ami-1.0` | 分离模型；gated，需先同意条款 |
+| `SEPARATION_TIMEOUT` / `SEPARATION_MIN_OVERLAP_SEC` / `SEPARATION_MAX_CLIP_SEC` | `600` / `0.8` / `60` | 单次分离超时、最短重叠、单片段上限（秒） |
+| `SEPARATION_RELEASE_ASR` | `1` | 分离前释放 ASR 模型；8GB 卡建议保持开启 |
 | `CHUNK_MINUTES` | `15` | 单文件最长时长，超过即切片 |
 | `CHUNK_SNAP_WINDOW` | `20` | 切点在 ±该秒数内吸附到静音中点；`0`=严格等分 |
 | `SILENCE_NOISE_DB` / `SILENCE_MIN_SEC` | `-35` / `0.6` | `silencedetect` 的静音阈值 |
@@ -815,6 +826,46 @@ python -m app.services.summarizer ./demo.json --out ./summary.md
 | `MERGE_GAP_SEC_NO_DIAR` | `0.3` | 无说话人标签时的合并窗口 |
 | `HALLU_NO_SPEECH_PROB` / `HALLU_AVG_LOGPROB` / `HALLU_COMPRESSION_RATIO` | `0.6` / `-1.0` / `2.4` | Whisper 幻觉过滤阈值（BGM/静音处的重复与「感谢观看」类输出） |
 | `HALLU_REPEAT_NGRAM` / `HALLU_REPEAT_COUNT` / `HALLU_REPEAT_MIN_CHARS` | `6` / `5` / `80` | 段内复读检测。命中时截断保留前半段；剩余不足 30% 才整段丢弃 |
+| `HALLU_GLUED` | `1` | 粘连文本处理：前半正常则截断，整段粘连保留并标 `low_quality`（总结跳过） |
+
+### 重叠语音分离（可选）
+
+多人同时说话时，单声道混音会让 Whisper 输出没有词边界的粘连文本：
+
+```
+againandagainsothosearethemechanicsandeffectssocardtime...
+```
+
+这不是音乐幻觉，也无法靠文本后处理恢复词边界。开启分离后：
+
+1. 用 diarization turns 算出「≥2 人同时说话」的区间；
+2. 调独立环境的 `pyannote/speech-separation-ami-1.0` 把区间拆成每个说话人一条 16k 轨；
+3. 每条轨单独跑 ASR（含语言检测），再替换回原时间轴，段上标 `separated: true`；
+4. 分离失败或环境缺失时自动回退到原转录结果，不阻塞任务。
+
+**安装（一次性）**：
+
+```bat
+scripts\setup-separation-env.bat
+```
+
+脚本会创建 `.venv-sep`（pyannote.audio 3.3.2 + torch cu124），并把解释器路径写进 `.env`：
+
+```ini
+SEPARATION_ENABLED=1
+SEPARATION_PYTHON=D:/projects/polyglot-media-summarizer/.venv-sep/Scripts/python.exe
+```
+
+还需要用同一个 HF 账号同意两个 gated 模型：`pyannote/separation-ami-1.0`、`pyannote/speech-separation-ami-1.0`。
+
+**为什么单独一个环境**：分离模型只支持 pyannote.audio 3.3.2，而本项目的 diarization 跑在 4.x，两个大版本不能装在一起。主进程用 subprocess 调脚本，互不干扰。
+
+**能力边界**：
+
+- 分离模型在 AMI 英语会议（单远端麦克风）上训练，对游戏直播 / 日语 PV 的分离质量需要实测；
+- 单个 5 秒窗口最多 3 个说话人；
+- 8GB 卡上分离与 ASR 不能同时常驻，默认 `SEPARATION_RELEASE_ASR=1` 先释放 ASR 再分离；
+- 分离不干净的轨仍可能残留少量粘连文本，这些段会被标 `low_quality`，总结阶段跳过。
 
 ### 总结
 
