@@ -33,6 +33,7 @@ import json
 import logging
 import os
 import time
+import warnings
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
@@ -41,6 +42,15 @@ from typing import Any, Callable, Sequence
 import torch
 
 from app.services.audio import AudioChunk, analyze, cleanup, probe_duration
+
+# torch 2.9 起旧的 TF32 开关被弃用，pyannote / lightning 仍在读它，每次启动都会刷一条
+# UserWarning。只按 message 精确屏蔽这一条（torchcodec / HF 权限等警告必须保留）。
+# 注意不能加 module= 限制：该警告的归属模块是调用方（pyannote），不是 torch.backends.cuda。
+warnings.filterwarnings(
+    "ignore",
+    message=r".*TF32 behavior.*",
+    category=UserWarning,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -79,6 +89,12 @@ DIAR_MAX_SPEAKERS = os.getenv("DIAR_MAX_SPEAKERS")
 DIAR_AUDIO_INPUT = (os.getenv("DIAR_AUDIO_INPUT", "waveform") or "waveform").strip().lower()
 # 整段 waveform 会常驻内存/显存：约 230MB/小时（16k float32）。超过该时长只告警。
 DIAR_MAX_HOURS = float(os.getenv("DIAR_MAX_HOURS", "2"))
+# 分离前裁掉首尾静音（长静音开头/结尾很常见，pyannote 对它们做滑窗纯属浪费）
+DIAR_TRIM_SILENCE = (os.getenv("DIAR_TRIM_SILENCE", "1") or "1").strip().lower() not in {
+    "0", "false", "no", "off",
+}
+DIAR_TRIM_MIN_SEC = float(os.getenv("DIAR_TRIM_MIN_SEC", "1.0"))  # 裁剪后至少保留的语音时长
+DIAR_ENERGY_THRESHOLD = float(os.getenv("DIAR_ENERGY_THRESHOLD", "0.001"))  # ≈ -60dBFS
 
 # 分离结果清洗：总时长过短的「幽灵说话人」（BGM/音效误聚类）并入最近的保留说话人
 DIAR_MIN_SPEAKER_SEC = float(os.getenv("DIAR_MIN_SPEAKER_SEC", "5"))
@@ -383,10 +399,33 @@ def _load_waveform_stdlib(path: Path, target_sr: int) -> tuple[torch.Tensor, int
     return torch.from_numpy(audio).unsqueeze(0), sr
 
 
-def _diarization_input(audio_path: Path) -> Any:
-    """按 DIAR_AUDIO_INPUT 生成 pipeline 的输入。"""
+def _speech_span(waveform: torch.Tensor, sr: int) -> tuple[float, float] | None:
+    """返回首个/最后一个「有能量」采样点覆盖的时间段（前后各留 1s 余量）。
+
+    用于在分离前裁掉首尾静音：84 分钟素材里可能有 20 分钟静音，
+    对它们做 pyannote 滑窗纯属浪费（实测约占总耗时的 25%）。
+    """
+    energy = waveform.abs().amax(dim=0)
+    index = torch.nonzero(energy > DIAR_ENERGY_THRESHOLD).flatten()
+    if index.numel() == 0:
+        return None
+
+    margin = sr  # 前后各留 1s，避免切掉实际的起音/尾音
+    start = max(0, int(index[0]) - margin)
+    end = min(waveform.size(1), int(index[-1]) + 1 + margin)
+    if (end - start) / sr < DIAR_TRIM_MIN_SEC:
+        return None
+    return start / sr, end / sr
+
+
+def _diarization_input(audio_path: Path) -> tuple[Any, float]:
+    """生成 pipeline 输入，返回 (payload, 时间偏移秒)。
+
+    payload 为 None 表示整段没有有效语音（调用方直接返回空 turns）。
+    waveform 模式会裁掉首尾静音，因此返回的 turns 需要加上这个偏移。
+    """
     if DIAR_AUDIO_INPUT == "path":
-        return str(audio_path)
+        return str(audio_path), 0.0
 
     try:
         waveform, sr = _load_waveform(audio_path)
@@ -395,10 +434,25 @@ def _diarization_input(audio_path: Path) -> Any:
     except Exception as exc:
         raise TranscriptionError(f"读取音频失败（{audio_path.name}）: {exc}") from exc
 
+    total_sec = waveform.size(1) / sr
+    offset = 0.0
+    if DIAR_TRIM_SILENCE:
+        span = _speech_span(waveform, sr)
+        if span is None:
+            return None, 0.0
+        start, end = span
+        if start > 0 or end < total_sec:
+            waveform = waveform[:, int(start * sr) : int(end * sr)]
+            offset = start
+            logger.info(
+                "分离前裁掉首尾静音：偏移 %.1fs，保留 %.1fs / %.1fs（%.0f MB）",
+                start, end - start, total_sec, waveform.numel() * 4 / 1e6,
+            )
+
     logger.info(
         "说话人分离输入：waveform（%.0f MB, sr=%d）", waveform.numel() * 4 / 1e6, sr
     )
-    return {"waveform": waveform, "sample_rate": sr}
+    return {"waveform": waveform, "sample_rate": sr}, offset
 
 
 def _opt_int(raw: str | None) -> int | None:
@@ -432,9 +486,14 @@ def diarize(
             duration / 3600, DIAR_MAX_HOURS, duration * 16000 * 4 / 1e6,
         )
 
+    payload, offset = _diarization_input(audio_path)
+    if payload is None:
+        logger.warning("整段音频没有检测到有效语音，跳过说话人分离: %s", audio_path.name)
+        return []
+
     started = time.time()
     try:
-        output = pipeline(_diarization_input(audio_path), **kwargs)
+        output = pipeline(payload, **kwargs)
     except TranscriptionError:
         raise
     except Exception as exc:
@@ -446,7 +505,11 @@ def diarize(
         raise TranscriptionError(f"无法解析 Pyannote 输出类型: {type(output)!r}")
 
     turns = [
-        DiarTurn(start=float(turn.start), end=float(turn.end), speaker=str(speaker))
+        DiarTurn(
+            start=round(float(turn.start) + offset, 3),
+            end=round(float(turn.end) + offset, 3),
+            speaker=str(speaker),
+        )
         for turn, _, speaker in annotation.itertracks(yield_label=True)
     ]
     turns.sort(key=lambda t: (t.start, t.end))
@@ -463,11 +526,15 @@ def _gap(a_start: float, a_end: float, b_start: float, b_end: float) -> float:
     return max(0.0, b_start - a_end, a_start - b_end)
 
 
-def _merge_short_speakers(turns: list[DiarTurn], total_duration: float) -> list[DiarTurn]:
+def _merge_short_speakers(turns: list[DiarTurn], speech_duration: float) -> list[DiarTurn]:
     """把总时长过短的「幽灵说话人」并入时间上最近的保留说话人。
 
     pyannote 3.1 在 BGM / 音效多的素材上容易额外聚出只说了两三秒的说话人，
     留着会让总结里出现「6 位说话人」这种明显错误的结果。
+
+    :param speech_duration: 有效语音总时长（不是文件总时长）。
+        用文件总时长算占比会偏高：84 分钟素材里含 20 分钟静音时，
+        1% 阈值会从 39s 被抬到 51s，真实的短发言者会被误合并。
     """
     if len({t.speaker for t in turns}) <= 1:
         return turns
@@ -476,7 +543,7 @@ def _merge_short_speakers(turns: list[DiarTurn], total_duration: float) -> list[
     for turn in turns:
         durations[turn.speaker] = durations.get(turn.speaker, 0.0) + turn.duration
 
-    floor = max(DIAR_MIN_SPEAKER_SEC, total_duration * DIAR_MIN_SPEAKER_SHARE)
+    floor = max(DIAR_MIN_SPEAKER_SEC, speech_duration * DIAR_MIN_SPEAKER_SHARE)
     kept = {name for name, seconds in durations.items() if seconds >= floor}
     if len(kept) == len(durations):
         return turns
@@ -506,13 +573,22 @@ def _merge_short_speakers(turns: list[DiarTurn], total_duration: float) -> list[
     return merged
 
 
-def _speaker_stats(turns: Sequence[DiarTurn]) -> list[dict]:
-    """每位说话人的总时长与段数，用于判断是否过度聚类（`SPEAKER_04` 只有 3 分钟时基本是幽灵）。"""
+def _speaker_stats(
+    turns: Sequence[DiarTurn],
+    mapping: dict[str, str] | None = None,
+) -> list[dict]:
+    """每位说话人的总时长与段数，用于判断是否过度聚类（`Speaker 4` 只有 3 分钟时基本是幽灵）。
+
+    :param mapping: renumber_speakers() 的 SPEAKER_xx -> Speaker N 映射，
+        传入后统计结果与 transcript.json 里的 speakers 一致。
+    """
     stats: dict[str, dict] = {}
     for turn in turns:
-        item = stats.setdefault(
-            turn.speaker, {"speaker": turn.speaker, "seconds": 0.0, "turns": 0}
-        )
+        if mapping is not None and turn.speaker not in mapping:
+            # 该说话人没有任何被转录到的片段（纯音效/被 VAD 裁掉），不参与统计
+            continue
+        name = mapping[turn.speaker] if mapping is not None else turn.speaker
+        item = stats.setdefault(name, {"speaker": name, "seconds": 0.0, "turns": 0})
         item["seconds"] = round(item["seconds"] + turn.duration, 1)
         item["turns"] += 1
     return sorted(stats.values(), key=lambda item: -item["seconds"])
@@ -970,6 +1046,7 @@ def transcribe_task(
     model: Any = None
     diar_pipeline: Any = None
     turns: list[DiarTurn] = []
+    diar_speech_sec = 0.0
     detected_languages: list[str] = []
     collected: list[dict] = []
     chunk_stats: list[dict] = []
@@ -1000,12 +1077,13 @@ def transcribe_task(
                     diar_pipeline, source_wav,
                     min_speakers=min_speakers, max_speakers=max_speakers,
                 )
-                turns = _merge_short_speakers(turns, total_duration)
-                diar_sec = round(sum(t.duration for t in turns), 1)
-                if total_duration:
+                # 清洗阈值用「有效语音时长」而不是文件总时长：长静音会把 1% 门槛抬高
+                diar_speech_sec = round(sum(t.duration for t in turns), 1)
+                turns = _merge_short_speakers(turns, diar_speech_sec)
+                if total_duration and diar_speech_sec:
                     logger.info(
-                        "说话人覆盖：%.0fs / %.0fs（%.1f%%）", diar_sec, total_duration,
-                        diar_sec / total_duration * 100,
+                        "说话人覆盖：%.0fs / 总时长 %.0fs（%.1f%%）",
+                        diar_speech_sec, total_duration, diar_speech_sec / total_duration * 100,
                     )
                 report("diarizing", 1.0, f"识别到 {len({t.speaker for t in turns})} 位说话人")
             except Exception as exc:
@@ -1132,13 +1210,26 @@ def transcribe_task(
                 "有效语音只占 %.2f%%，疑似纯音乐/无人讲解：%s", speech_ratio * 100, source_wav.name
             )
 
+        # 分离覆盖与转录语音量应大致一致：偏差过大说明分离或转录有问题
+        if diar_speech_sec > 0:
+            delta = (speech_sec - diar_speech_sec) / diar_speech_sec * 100
+            logger.info(
+                "分离/转录一致性：分离 %.0fs / 转录 %.0fs（偏差 %+.1f%%）",
+                diar_speech_sec, speech_sec, delta,
+            )
+            if abs(delta) > 20:
+                logger.warning(
+                    "分离与转录的语音量相差 %.1f%%，建议检查 transcript.json 与分离结果",
+                    delta,
+                )
+
         result_payload = {
             "language": language_out,
             "chunk_languages": detected_languages,
             "chunks": chunk_stats,
             "segments": segments,
             "speakers": [mapping[k] for k in sorted(mapping, key=lambda k: int(mapping[k].split()[-1]))],
-            "speaker_stats": _speaker_stats(turns),
+            "speaker_stats": _speaker_stats(turns, mapping),
             "num_segments": len(segments),
             "duration_sec": total_duration,
             "diarized": bool(turns),

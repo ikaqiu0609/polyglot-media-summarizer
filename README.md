@@ -964,7 +964,9 @@ python -m app.services.summarizer ./demo.json --out ./summary.md
 | `DIAR_AUDIO_INPUT` | `waveform` | `waveform`=自己解码 16k wav 传入（**不依赖 torchcodec**，推荐）；`path`=把路径交给 pyannote（需 torchcodec 与 torch 版本匹配 + 共享版 FFmpeg） |
 | `ENABLE_DIARIZATION` | `true` | 关掉则只转录不打说话人标签（可省 HF_TOKEN） |
 | `DIAR_MIN_SPEAKERS` / `DIAR_MAX_SPEAKERS` | 空 | 已知人数时设置，显著提升准确率；`/upload` 的 `speakers` 表单字段等价 |
-| `DIAR_MIN_SPEAKER_SEC` / `DIAR_MIN_SPEAKER_SHARE` | `5` / `0.01` | 低于该时长的「幽灵说话人」并入最近的保留说话人（防 BGM 误聚类） |
+| `DIAR_TRIM_SILENCE` | `1` | 分离前裁掉首尾静音（长静音开头能省约 25% 分离耗时；整段无语音时直接跳过） |
+| `DIAR_TRIM_MIN_SEC` / `DIAR_ENERGY_THRESHOLD` | `1.0` / `0.001` | 裁剪后至少保留的语音时长、能量阈值（≈ -60dBFS） |
+| `DIAR_MIN_SPEAKER_SEC` / `DIAR_MIN_SPEAKER_SHARE` | `5` / `0.01` | 低于该时长的「幽灵说话人」并入最近的保留说话人；占比按**有效语音时长**计算，不含静音 |
 | `MAX_SPEAKER_ATTACH_GAP` | `2.0` | segment 与最近说话人时间片超过该间隔就标 `UNKNOWN`（宁缺勿错） |
 | `DIAR_CACHE_FAILURE` | `1` | 只缓存永久性失败（403/token）；临时错误（OOM/网络）下个任务重试。`0`=完全不缓存 |
 | `CHUNK_MINUTES` | `15` | 单文件最长时长，超过即切片 |

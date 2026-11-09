@@ -14,6 +14,8 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:  # 允许直接 python tests/test_pipeline_utils.py
     sys.path.insert(0, str(ROOT))
 
+import torch  # noqa: E402
+
 from app.services import audio, summarizer, transcribe  # noqa: E402
 
 
@@ -93,14 +95,76 @@ def _turn(start: float, end: float, speaker: str) -> transcribe.DiarTurn:
 
 def test_merge_short_speakers_folds_ghost() -> None:
     turns = [_turn(0, 100, "A"), _turn(100, 160, "B"), _turn(160, 162, "GHOST")]
-    merged = transcribe._merge_short_speakers(turns, total_duration=162)
+    merged = transcribe._merge_short_speakers(turns, speech_duration=162)
     assert {t.speaker for t in merged} == {"A", "B"}
     assert merged[-1].speaker == "B"
+
+
+def test_merge_short_speakers_uses_speech_duration() -> None:
+    # 阈值 = max(5s, 有效语音×1%)。3840s 语音 → 38.4s，40s 的说话人应保留
+    turns = [_turn(0, 3800, "A"), _turn(3800, 3840, "B")]
+    assert {t.speaker for t in transcribe._merge_short_speakers(turns, 3840)} == {"A", "B"}
 
 
 def test_merge_short_speakers_keeps_single_speaker() -> None:
     turns = [_turn(0, 100, "A")]
     assert transcribe._merge_short_speakers(turns, 100) == turns
+
+
+# ---------------------------------------------------------------------------
+# transcribe: 分离前裁静音
+# ---------------------------------------------------------------------------
+def test_speech_span_trims_leading_and_trailing_silence() -> None:
+    sr = 16000
+    waveform = torch.zeros(1, sr * 10)
+    waveform[:, sr * 2 : sr * 6] = 0.5
+    span = transcribe._speech_span(waveform, sr)
+    assert span is not None
+    start, end = span
+    assert abs(start - 1.0) < 0.01   # 2s 起始 - 1s 余量
+    assert abs(end - 7.0) < 0.01     # 6s 结束 + 1s 余量
+
+
+def test_speech_span_returns_none_for_silence() -> None:
+    assert transcribe._speech_span(torch.zeros(1, 16000), 16000) is None
+
+
+class _UnexpectedPipeline:
+    def __call__(self, *args, **kwargs):
+        raise AssertionError("全静音音频不应调用 pyannote")
+
+
+def test_diarize_skips_fully_silent_audio() -> None:
+    sr = 16000
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "silent.wav"
+        with wave.open(str(path), "wb") as handle:
+            handle.setnchannels(1)
+            handle.setsampwidth(2)
+            handle.setframerate(sr)
+            handle.writeframes(b"\x00\x00" * (sr * 3))
+
+        assert transcribe.diarize(_UnexpectedPipeline(), path) == []
+
+
+def test_diarization_input_trims_silence_and_offsets() -> None:
+    sr = 16000
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "clip.wav"
+        with wave.open(str(path), "wb") as handle:
+            handle.setnchannels(1)
+            handle.setsampwidth(2)
+            handle.setframerate(sr)
+            silence = b"\x00\x00" * (sr * 2)
+            tone = b"\x00\x40" * (sr * 4)  # int16 0x4000 → 0.5
+            handle.writeframes(silence + tone + silence)
+
+        payload, offset = transcribe._diarization_input(path)
+
+    assert payload is not None
+    assert offset == 1.0                      # 2s 起始 - 1s 余量
+    assert payload["sample_rate"] == sr
+    assert abs(payload["waveform"].size(1) / sr - 6.0) < 0.01
 
 
 def test_nearest_speaker_respects_max_gap() -> None:
@@ -153,6 +217,13 @@ def test_speaker_stats_sorted_by_duration() -> None:
     stats = transcribe._speaker_stats(turns)
     assert stats[0] == {"speaker": "A", "seconds": 20.0, "turns": 2}
     assert stats[1] == {"speaker": "B", "seconds": 5.0, "turns": 1}
+
+
+def test_speaker_stats_applies_renumber_mapping() -> None:
+    turns = [_turn(0, 10, "SPEAKER_03"), _turn(10, 15, "SPEAKER_00")]
+    stats = transcribe._speaker_stats(turns, {"SPEAKER_03": "Speaker 1", "SPEAKER_00": "Speaker 2"})
+    assert stats[0]["speaker"] == "Speaker 1"
+    assert stats[1]["speaker"] == "Speaker 2"
 
 
 # ---------------------------------------------------------------------------
@@ -297,12 +368,55 @@ def test_speaker_mode_three_states() -> None:
     assert summarizer._extract_segments(imported)[1]["speaker_mode"] == "single"
 
 
+def test_extract_segments_keeps_speaker_stats() -> None:
+    payload = _payload(
+        "Speaker 1",
+        speakers=["Speaker 1"],
+        diarized=True,
+        speaker_stats=[{"speaker": "Speaker 1", "seconds": 10.0, "turns": 2}],
+    )
+    meta = summarizer._extract_segments(payload)[1]
+    assert meta["speaker_stats"][0]["speaker"] == "Speaker 1"
+
+
 def test_meta_line_matches_speaker_mode() -> None:
     multi = summarizer._postprocess_markdown(
         "# 标题", duration=65, speakers=[], language="multilingual", speaker_mode="multi_unlabeled"
     )
     assert "多人对话" in multi
     assert "00:01:05" in multi
+
+
+def test_meta_line_includes_speaker_breakdown() -> None:
+    stats = [
+        {"speaker": "Speaker 1", "seconds": 62.0, "turns": 3},
+        {"speaker": "Speaker 2", "seconds": 38.0, "turns": 2},
+    ]
+    out = summarizer._postprocess_markdown(
+        "# 标题",
+        duration=100,
+        speakers=["Speaker 1", "Speaker 2"],
+        language="en",
+        speaker_mode="labeled",
+        speaker_stats=stats,
+    )
+    assert "说话人 2 位" in out
+    assert "Speaker 1 62%" in out and "Speaker 2 38%" in out
+
+
+def test_meta_line_replaces_model_written_meta() -> None:
+    stats = [{"speaker": "Speaker 1", "seconds": 90.0, "turns": 9}]
+    markdown = "# 标题\n> 时长 00:01:40 ｜ 说话人 1 位 ｜ 检测语言 en\n\n## 一、内容概览\n正文"
+    out = summarizer._postprocess_markdown(
+        markdown,
+        duration=100,
+        speakers=["Speaker 1"],
+        language="en",
+        speaker_mode="labeled",
+        speaker_stats=stats,
+    )
+    assert out.count("> 时长") == 1  # 不会出现两行元信息
+    assert "Speaker 1 100%" in out
 
 
 if __name__ == "__main__":

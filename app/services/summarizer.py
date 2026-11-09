@@ -515,6 +515,20 @@ def _system_prompt(speaker_mode: str) -> str:
     return SINGLE_SPEAKER_SYSTEM_PROMPT
 
 
+def _speaker_breakdown(speaker_stats: Sequence[dict]) -> str:
+    """把 speaker_stats 压成一行占比，例如 `Speaker 1 62% / Speaker 2 33% / Speaker 3 5%`。
+
+    只占 5% 的说话人不该在「说话人观察」里占一整段，读者需要看到权重。
+    """
+    total = sum(float(item.get("seconds") or 0) for item in speaker_stats)
+    if total <= 0:
+        return ""
+    return " / ".join(
+        f"{item.get('speaker')} {float(item.get('seconds') or 0) / total * 100:.0f}%"
+        for item in speaker_stats
+    )
+
+
 def summarize_block(
     block: TranscriptBlock,
     total: int,
@@ -638,6 +652,7 @@ def global_summary(
     speakers: Sequence[str],
     language: str,
     speaker_mode: str = "labeled",
+    speaker_stats: Sequence[dict] = (),
 ) -> tuple[str, dict]:
     """第二阶段：局部摘要 -> 全局中文 Markdown 总结。"""
     digest = build_digest(summaries)
@@ -661,7 +676,12 @@ def global_summary(
     )
     markdown = _strip_code_fence(content)
     markdown = _postprocess_markdown(
-        markdown, duration=duration, speakers=speakers, language=language, speaker_mode=speaker_mode
+        markdown,
+        duration=duration,
+        speakers=speakers,
+        language=language,
+        speaker_mode=speaker_mode,
+        speaker_stats=speaker_stats,
     )
     return markdown, usage
 
@@ -673,10 +693,15 @@ def _postprocess_markdown(
     speakers: Sequence[str],
     language: str,
     speaker_mode: str = "labeled",
+    speaker_stats: Sequence[dict] = (),
 ) -> str:
-    """补齐头部元信息，保证输出一定有「一级标题 + 元信息行」，即使模型漏写。"""
+    """补齐/修正头部元信息，保证输出一定有「一级标题 + 元信息行」。"""
     if speaker_mode == "labeled":
-        meta = f"> 时长 {format_timestamp(duration)} ｜ 说话人 {len(speakers)} 位 ｜ 检测语言 {language}"
+        breakdown = _speaker_breakdown(speaker_stats)
+        speaker_part = (
+            f"说话人 {len(speakers)} 位（{breakdown}）" if breakdown else f"说话人 {len(speakers)} 位"
+        )
+        meta = f"> 时长 {format_timestamp(duration)} ｜ {speaker_part} ｜ 检测语言 {language}"
     elif speaker_mode == "multi_unlabeled":
         meta = f"> 时长 {format_timestamp(duration)} ｜ 多人对话（未分离说话人） ｜ 检测语言 {language}"
     else:
@@ -687,8 +712,11 @@ def _postprocess_markdown(
     if not lines or not re.match(r"^#\s+\S", lines[0].lstrip()):
         lines = ["# 内容总结", "", *lines]
 
-    if any(line.strip().startswith("> 时长") for line in lines[:6]):
-        return "\n".join(lines).strip() + "\n"
+    # 模型自己写的元信息行信息量不足（只有「说话人 4 位」），用我们算好的版本替换
+    for i, line in enumerate(lines[:6]):
+        if line.strip().startswith("> 时长"):
+            lines[i] = meta
+            return "\n".join(lines).strip() + "\n"
 
     lines.insert(1, "")
     lines.insert(2, meta)
@@ -780,10 +808,17 @@ def _extract_segments(payload: Any) -> tuple[list[dict], dict]:
     else:
         speaker_mode = "single"
 
+    raw_stats = payload.get("speaker_stats")
+    speaker_stats = [
+        item for item in raw_stats
+        if isinstance(item, dict) and item.get("speaker")
+    ] if isinstance(raw_stats, list) else []
+
     meta = {
         "duration": float(payload.get("duration_sec") or 0.0),
         "language": str(payload.get("language") or "auto"),
         "speakers": speakers,
+        "speaker_stats": speaker_stats,
         "diarized": diarized,
         "speaker_mode": speaker_mode,
         "diarization": diarization if isinstance(diarization, dict) else None,
@@ -843,6 +878,7 @@ def summarize(
         speakers=meta["speakers"],
         language=meta["language"],
         speaker_mode=meta["speaker_mode"],
+        speaker_stats=meta["speaker_stats"],
     )
     for key in usage_total:
         usage_total[key] += final_usage.get(key, 0)
@@ -859,6 +895,7 @@ def summarize(
             "duration_ts": format_timestamp(meta["duration"]),
             "language": meta["language"],
             "speakers": meta["speakers"],
+            "speaker_stats": meta["speaker_stats"],
             "diarized": meta["diarized"],
             "speaker_mode": meta["speaker_mode"],
             "diarization": meta["diarization"],
