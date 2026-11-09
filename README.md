@@ -35,14 +35,14 @@
 | 能力 | 实现 | 说明 |
 |---|---|---|
 | 音频抽取 | FFmpeg | 任意容器 → 16kHz / 单声道 / PCM16 WAV，`-c:a copy` 切片不重编码 |
-| 语音识别 | `murmurai-core`（WhisperX fork）+ `faster-whisper` | 支持 `large-v3` / `large-v3-turbo` / `medium`；8GB 显卡推荐 `large-v3-turbo` |
+| 语音识别 | `murmurai-core`（WhisperX fork）+ `faster-whisper` | 支持 `large-v3` / `large-v3-turbo` / `medium`，按 [显存档位推荐](#显存档位推荐) 选择 |
 | 说话人分离 | `pyannote.audio` + `pyannote/speaker-diarization-3.1` | 整段只跑一次，跨切片说话人标签一致 |
 | 长音频处理 | FFmpeg 按时长切片 + Silero VAD | 超过 15 分钟自动切分，规避显存溢出 |
 | 边界拼接 | 切点吸附静音 + 词级拆段 + 字符级去重 | 切片切点造成的半句/重复词自动修复 |
 | 结构化总结 | DeepSeek（OpenAI SDK 兼容） | 分段摘要 → 全局聚合，输出六段式中文 Markdown |
 | **费用控制** | **两段式（转录 / 总结解耦）** | **转录免费且本地完成，JSON 落盘后停在 `transcribed`；只有显式调用 `/summarize` 才产生 API 费用** |
 | 服务化 | FastAPI + BackgroundTasks | 上传即返回 `task_id`，轮询进度 |
-| 运行环境 | Windows 10 / 11 + NVIDIA 显卡 | 显存 ≥ 6GB；RTX 4070 8GB 可跑 `medium` 或 `large-v3-turbo` |
+| 运行环境 | Windows 10 / 11 + NVIDIA 显卡 | 最低 4GB（需关闭说话人分离）；推荐 6GB 以上 |
 | 配置方式 | 环境变量 + `.env` | 项目根目录的 `.env`（`python-dotenv`） |
 
 ---
@@ -210,7 +210,7 @@ curl.exe -s -X POST http://127.0.0.1:8000/summarize -F "file=@.\demo.transcript.
 | 项 | 要求 | 怎么确认 |
 |---|---|---|
 | 系统 | Windows 10 / 11 64 位 | `winver` |
-| 显卡 | NVIDIA，显存 ≥ 6GB（RTX 4070 8G 够用） | `nvidia-smi` |
+| 显卡 | NVIDIA，显存 ≥ 4GB；推荐 6GB 以上（分离约需 2GB） | `nvidia-smi` |
 | 驱动 | 支持 CUDA 12.8（`nvidia-smi` 右上角 `CUDA Version` ≥ 12.8） | 低于 12.8 先去官网升级驱动 |
 | 磁盘 | ≥ 15GB 空闲（torch 约 3GB + 模型 3~6GB + 数据） | 资源管理器 |
 | 软件 | Git、Python（3.10~3.13，**不要 3.14**）、FFmpeg | 见第 2~4 步 |
@@ -389,14 +389,14 @@ notepad .env
 | `HF_TOKEN` | `hf_...` | 必填；需为 [3 个 gated 模型](#0-三个必须-agree-的-gated-模型) 点过 Agree 的账号 |
 | `DEEPSEEK_API_KEY` | `sk-...` | 只有生成总结时才会用到 |
 | `AUTO_SUMMARIZE` | `false` | 保持 false：转录完先停下，确认后再决定是否总结 |
-| `ASR_MODEL` | `large-v3-turbo` | 8GB 显存推荐；显存更紧可改 `medium`，追求精度可改 `large-v3` |
-| `ASR_COMPUTE_TYPE` | `float16` | 8GB 显存紧张时改 `int8_float16` |
-| `ASR_BATCH_SIZE` | `4` | 8GB 显存建议 4；OOM 时服务会自动减半重试 |
-| `ASR_ALIGN` | `1` | 分离失败时自动跳过词级对齐 |
-| `CHUNK_MINUTES` | `10` | 单片更短，峰值显存更低 |
+| `ASR_MODEL` | `large-v3-turbo` | 按 [显存档位推荐](#显存档位推荐) 选择 |
+| `ASR_COMPUTE_TYPE` | `float16` | 显存不足时改 `int8_float16` |
+| `ASR_BATCH_SIZE` | `4` | 起始值；OOM 时服务会自动减半重试 |
+| `ASR_ALIGN` | `1` | 分离失败时自动跳过词级对齐；显存紧张可设 `0` |
+| `CHUNK_MINUTES` | `10` | 影响时间戳精度与重跑粒度，对峰值显存影响很小 |
 | `DATA_ROOT` | `data` | 相对路径按项目根解析，不要写 `C:\...` |
 
-- 12GB 以上显存可以把 `ASR_MODEL=large-v3`、`ASR_COMPUTE_TYPE=float16`、`ASR_BATCH_SIZE=8`。
+- 其他显存档位的推荐组合见 [显存档位推荐](#显存档位推荐)。
 - 记事本保存即可（`app/config.py` 按 UTF-8 读取）。
 - 路径类配置支持 `D:/data`、`%USERPROFILE%/data`、`data`（相对项目根）。
 
@@ -407,7 +407,7 @@ python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
 ```
 
 - 成功标志：`Uvicorn running on http://127.0.0.1:8000`
-- 首次转录会下载模型（`large-v3-turbo` 约 1.6GB + pyannote 权重），默认存 `%USERPROFILE%\.cache\huggingface`；想换盘就在 `.env` 里设绝对路径 `HF_HOME=D:/models/huggingface`。
+- 首次转录会按所选模型下载权重（`medium` / `large-v3-turbo` 约 1.5~1.6GB，`large-v3` 约 3GB），连同 pyannote 权重默认存 `%USERPROFILE%\.cache\huggingface`；想换盘就在 `.env` 里设绝对路径 `HF_HOME=D:/models/huggingface`。
 - **不要加 `--workers`**：任务状态在进程内存里。
 
 ### 10. 验证
@@ -492,7 +492,7 @@ rem 局域网访问（本项目无鉴权，谨慎）
 scripts\start-server.bat -BindAddress 0.0.0.0
 ```
 
-自检输出示例：
+自检输出示例（显卡与版本以实际机器为准）：
 
 ```
 ==== Polyglot Media Summarizer · 环境自检 ====
@@ -501,7 +501,7 @@ scripts\start-server.bat -BindAddress 0.0.0.0
 1/8 Python 解释器
   [OK]   使用虚拟环境: D:\code\polyglot-media-summarizer\.venv\Scripts\python.exe
 4/8 PyTorch 与 CUDA
-  [OK]   torch 2.9.0+cu128 · CUDA 可用 · NVIDIA GeForce RTX 4070 · 8.0GB 显存
+  [OK]   torch 2.9.0+cu128 · CUDA 可用 · NVIDIA GeForce RTX xxxx · xxGB 显存
 5/8 cuDNN 9（ctranslate2）
   [OK]   ctranslate2 检测到 1 个 CUDA 设备（cuDNN 9 已就绪）
 8/8 配置与数据目录
@@ -578,7 +578,7 @@ data/uploads/{task_id}.mp4                ← 原始上传文件
 
 ### 要等多久
 
-见 [性能与显存](#性能与显存)。8GB 显卡上，10 分钟内容约 4~6 分钟（转录），1 小时约 20~30 分钟。总结另算（几秒到几十秒），默认需要手动触发。
+见 [性能与显存](#性能与显存)。转录耗时主要取决于有效语音时长、显卡与所选模型：先按档位表选配置，再参考日志里的实际耗时与峰值微调。总结另算（几秒到几十秒），默认需要手动触发。
 
 ---
 
@@ -771,9 +771,9 @@ python -m app.services.summarizer ./demo.json --out ./summary.md
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
-| `ASR_MODEL` | `large-v3` | 8GB 显卡推荐 `large-v3-turbo`；显存更紧可用 `medium` |
+| `ASR_MODEL` | `large-v3` | 按 [显存档位推荐](#显存档位推荐) 选择；显存不足时优先 `large-v3-turbo` 或 `medium` |
 | `ASR_LANGUAGE` | `auto` | 英文夹韩日建议 `auto`；强制单语设 `en` |
-| `ASR_COMPUTE_TYPE` | `float16` | 8GB 显存可用 `int8_float16`；CPU 下自动降级 `int8` |
+| `ASR_COMPUTE_TYPE` | `float16` | 显存不足时用 `int8_float16`；CPU 下自动降级 `int8` |
 | `ASR_BATCH_SIZE` | `16` | OOM 时自动减半重试，最多 2 次 |
 | `VAD_METHOD` | `silero` | 免额外许可，但首次要从 GitHub（torch.hub）下载，网络受限时改 `pyannote`（走 HF，需接受 `segmentation-3.0` 条款）；silero 失败会自动回退 pyannote 重试一次 |
 | `ASR_ALIGN` | `1` | 词级对齐开关（`0` 关闭）。对齐只用于「按说话人拆段」，没有说话人标签时一律跳过 |
@@ -812,22 +812,42 @@ python -m app.services.summarizer ./demo.json --out ./summary.md
 
 ## 性能与显存
 
-### 8GB 显存（如 RTX 4070，`large-v3-turbo` + `float16` + `batch_size=4`）
+转录耗时与显存峰值取决于模型、量化方式、batch 和显卡。先按显存档位选配置，再用日志里的实际峰值微调。
 
-| 内容时长 | 显存峰值 | 端到端（估算） |
-|---|---|---|
-| 10 分钟 | ~4~5GB | ~4~6 分钟 |
-| 1 小时 | ~5~6GB | ~20~30 分钟 |
-| 3 小时 | ~5~6GB | ~60~90 分钟 |
+### 显存档位推荐
 
-- 显存吃紧时按优先级依次降：`ASR_BATCH_SIZE=2` → `ASR_MODEL=medium` → `ENABLE_DIARIZATION=false`（省掉 pyannote 的约 2GB）。
-- 说话人分离先于 ASR 模型加载，分离结束立即释放 pyannote，两个模型不会同时驻留；日志分别打印「分离阶段显存峰值」和「转录峰值显存」，`transcript.json` 的 `peak_vram_mb` 是转录阶段峰值（PyTorch allocator 口径，略低于 `nvidia-smi` 的总占用）。
-- 说话人分离在**整段 wav** 上运行，与切片数无关。
-- 上表不含首次模型下载：对齐开启且分离成功时，首次处理某语言还会下载约 1.2GB 的 wav2vec2 对齐模型（中文/韩语各一份）。
+| 显存（`nvidia-smi`） | `ASR_MODEL` | `ASR_COMPUTE_TYPE` | `ASR_BATCH_SIZE` | 峰值参考 | 说明 |
+|---|---|---|---|---|---|
+| 4–6GB | `medium` | `int8_float16` | 2 | 3.5~4.5GB | 分离吃紧时设 `ENABLE_DIARIZATION=false` |
+| 6–8GB | `large-v3-turbo` | `int8_float16` | 4 | 4~5GB | 主流显卡，速度与精度平衡 |
+| 8–12GB | `large-v3-turbo` | `float16` | 4（可试 8） | 5~6GB | 默认推荐组合 |
+| 12–16GB | `large-v3` | `float16` | 4（可试 8） | 6.5~8GB | 精度优先 |
+| 16–24GB | `large-v3` | `float16` | 8（可试 16） | 8~11GB | 长视频、批量任务 |
+| ≥24GB | `large-v3` | `float16` | 16+ | 10~13GB | 余量充足 |
 
-### 12GB 以上显存
+- 峰值 ≈ Whisper 权重 + 词级对齐模型（约 1.2GB）+ 推理激活 + CUDA 上下文；说话人分离先跑并释放，不与 ASR 叠加。
+- `ASR_BATCH_SIZE` 是起始值，OOM 后服务会自动减半重试；稳定后可逐级上调。
+- 4~6GB 档位若必须开启说话人分离，可先设 `ASR_ALIGN=0` 省约 1.2GB；仍 OOM 再关 `ENABLE_DIARIZATION`。
+- 纯 CPU 可运行（`ASR_DEVICE=cpu` + `int8`），但转录与分离会慢一个数量级。
 
-可以用 `ASR_MODEL=large-v3` + `ASR_COMPUTE_TYPE=float16` + `ASR_BATCH_SIZE=8`，精度更好，代价是转录时间约为 `large-v3-turbo` 的 2 倍。
+### 如何确认档位与峰值
+
+```bat
+nvidia-smi --query-gpu=name,memory.total --format=csv
+```
+
+任务日志会打印两行：
+
+```
+分离阶段显存峰值 1630 MB
+转录峰值显存 5217 MB
+```
+
+`transcript.json` 的 `peak_vram_mb` 是转录阶段峰值。两者都是 PyTorch allocator 口径，`nvidia-smi` 会再高 0.5~1GB（CUDA 上下文、桌面占用等）。
+
+### 实测参考
+
+RTX 4070 8GB + `medium` + `int8_float16` + `batch_size=4`：84 分钟素材（含 20 分钟静音），分离约 4 分钟、转录约 5 分钟，`nvidia-smi` 峰值约 4.2GB。不同显卡按上表与模型速度比例浮动。
 
 ### 成本
 
@@ -854,7 +874,7 @@ python -m app.services.summarizer ./demo.json --out ./summary.md
 <details>
 <summary><b>CUDA out of memory</b></summary>
 
-服务端已内置「OOM 自动减半 `batch_size`，最多重试 2 次」。仍失败时按顺序降级：`ASR_BATCH_SIZE` → `CHUNK_MINUTES` → `ASR_MODEL`（8G 卡可用 `medium` + `int8_float16`）。也可临时 `ENABLE_DIARIZATION=false` 只跑转录，省掉 pyannote 的约 2GB。
+服务端已内置「OOM 自动减半 `batch_size`，最多重试 2 次」。仍失败时按 [显存档位推荐](#显存档位推荐) 降一档：`ASR_BATCH_SIZE` 减半 → `ASR_COMPUTE_TYPE=int8_float16` → `ASR_MODEL` 降档 → `ASR_ALIGN=0` → `ENABLE_DIARIZATION=false`。
 </details>
 
 <details>

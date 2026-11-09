@@ -12,7 +12,7 @@
       5. cuDNN 9（ctranslate2 能否看到显卡）
       6. FFmpeg / FFprobe 路径
       7. .env 与两个密钥
-      8. 数据目录与 ASR 参数（8G 显存会提示降档）
+      8. 数据目录与 ASR 参数（按显存档位提示降档）
 
     有任何 [FAIL] 都会以退出码 1 结束；[WARN] 不影响启动。
 
@@ -321,9 +321,19 @@ if ($info.config_error) {
 } else {
     Ok "data_root = $($info.data_root)"
     Ok "ASR: model=$($info.asr_model) compute=$($info.compute_type) batch=$($info.batch) chunk=$($info.chunk_minutes)min"
-    if ($info.vram_gb -and $info.vram_gb -lt 10 -and $info.asr_model -eq "large-v3") {
-        Warn "显存仅 $($info.vram_gb)GB，但 ASR_MODEL 仍是 large-v3（约需 10GB+）"
-        Hint "在 .env 里改：ASR_MODEL=medium / ASR_COMPUTE_TYPE=int8_float16 / ASR_BATCH_SIZE=4"
+    if ($info.vram_gb) {
+        $vram = [double]$info.vram_gb
+        $model = "$($info.asr_model)"
+        $compute = "$($info.compute_type)"
+        if ($vram -lt 6 -and $model -ne "medium") {
+            Warn "显存 $vram GB，ASR_MODEL=$model 容易 OOM"
+            Hint "建议降档：ASR_MODEL=medium / ASR_COMPUTE_TYPE=int8_float16 / ASR_BATCH_SIZE=2；仍 OOM 可设 ENABLE_DIARIZATION=false"
+        } elseif ($vram -lt 10 -and $model -eq "large-v3") {
+            Warn "显存 $vram GB，ASR_MODEL=large-v3 余量不足"
+            Hint "建议改 large-v3-turbo：ASR_MODEL=large-v3-turbo / ASR_COMPUTE_TYPE=int8_float16 / ASR_BATCH_SIZE=4"
+        } elseif ($vram -ge 10 -and $model -eq "large-v3" -and $compute -eq "float16") {
+            Ok "显存档位匹配（$vram GB / large-v3 + float16），稳定后可试 ASR_BATCH_SIZE=8"
+        }
     }
 }
 
