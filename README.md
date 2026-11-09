@@ -5,7 +5,7 @@
 
 **默认两段式，不会自动产生费用**：转录（本地 GPU，免费）→ `transcribed` 暂停 → 调用 `/summarize` → DeepSeek 总结（付费）。详见 [两段式流程](#两段式流程转录免费总结付费)。
 
-支持 `.mp4 / .mkv / .mov / .webm / .mp3 / .wav / .m4a / .flac ...`，以英文为主、夹杂韩语/日语的音视频效果最佳。
+支持 `.mp4 / .mkv / .mov / .webm / .mp3 / .wav / .m4a / .flac ...`，适配中文/英文/韩文/日文等语言的混合视频（如各种国际直播）。
 
 ---
 
@@ -60,14 +60,14 @@
                     ├────────────────────────────────────────────────┤
                     │ ② transcribe.py       （本地 GPU，不花钱）      │
                     │    pyannote 整段分离 → murmurai 逐片转录        │
-                    │    → 全局时间戳 → 边界合并去重                  │
+                    │    → 全局时间戳 → 边界合并去重                   │
                     └───────────────────┬────────────────────────────┘
                                         │
                      data/outputs/{task_id}.transcript.json
                                         │
                          ┌──────────────▼──────────────┐
-                         │ status = transcribed（暂停）│
-                         │ 不调用 DeepSeek，不产生费用 │
+                         │ status = transcribed（暂停） │
+                         │ 不调用 DeepSeek，不产生费用   │
                          └──────────────┬──────────────┘
                                         │ 显式确认（二选一）
                     ┌───────────────────┴────────────────────┐
@@ -77,8 +77,8 @@
                                         │
                     ┌───────────────────▼────────────────────────────┐
                     │ ③ summarizer.py      （DeepSeek，按 token 计费）│
-                    │    Map：按字数分块 → JSON 局部摘要（校验时间戳）│
-                    │    Reduce：片段索引 → 六段式中文 Markdown       │
+                    │    Map：按字数分块 → JSON 局部摘要（校验时间戳）  │
+                    │    Reduce：片段索引 → 六段式中文 Markdown        │
                     └───────────────────┬────────────────────────────┘
                                         │
                              data/outputs/{task_id}.md
@@ -590,7 +590,7 @@ data/uploads/{task_id}.mp4                ← 原始上传文件
 | 字段 | 类型 | 说明 |
 |---|---|---|
 | `file` | file | 必填，媒体文件 |
-| `speakers` | int | 可选（1~20），已知说话人数，作为 pyannote 的 min/max |
+| `speakers` | string（数字） | 可选（填 1~20 的整数），已知说话人数，作为 pyannote 的 min/max；**留空即自动判断**（Swagger UI 里默认就是空框，不会替你填 1） |
 
 响应字段：
 
@@ -602,7 +602,7 @@ data/uploads/{task_id}.mp4                ← 原始上传文件
 | `size_bytes` | int | 实际落盘字节数 |
 | `status_url` / `result_url` | string | 后续查询地址 |
 
-错误：`415` 不支持的扩展名、`413` 超过 `MAX_UPLOAD_MB`、`400` 空文件。
+错误：`415` 不支持的扩展名、`413` 超过 `MAX_UPLOAD_MB`、`400` 空文件、`422` `speakers` 不是 1~20 的整数。
 
 ### `POST /transcribe/{task_id}`
 

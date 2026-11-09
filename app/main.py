@@ -6,13 +6,13 @@
     只有用户显式调用 /summarize/* 才会调用 DeepSeek 并计费。
     设 AUTO_SUMMARIZE=true 可恢复「转录完立即总结」的旧行为。
 
-接口：
+接口（注册顺序即 Swagger UI 的展示顺序）：
     POST /upload              上传媒体文件，立即返回 task_id（后台抽取+转录）
-    POST /transcribe/{task_id} 用已上传的媒体重新转录
-    POST /summarize/{task_id} 对已转录任务生成总结（会调用 DeepSeek，产生费用）
-    POST /summarize           导入现成的 transcript.json 并总结
     GET  /status/{task_id}    查询状态与进度百分比
+    POST /summarize/{task_id} 对已转录任务生成总结（会调用 DeepSeek，产生费用）
     GET  /result/{task_id}    下载 Markdown 总结
+    POST /transcribe/{task_id} 用已上传的媒体重新转录
+    POST /summarize           导入现成的 transcript.json 并总结
     GET  /healthz             健康检查（不返回任何密钥）
 
 并发模型：
@@ -631,6 +631,21 @@ async def _save_upload(upload: UploadFile, dest: Path, max_bytes: int) -> int:
     return size
 
 
+def _parse_speakers(raw: str | None) -> int | None:
+    """解析表单里的说话人数：空值 = 自动判断，非空必须是 1-20 的整数。"""
+    if raw is None or not raw.strip():
+        return None
+    try:
+        value = int(raw.strip())
+    except ValueError:
+        raise HTTPException(
+            status_code=422, detail="speakers 需为 1-20 的整数，或留空自动判断"
+        ) from None
+    if not 1 <= value <= 20:
+        raise HTTPException(status_code=422, detail="speakers 需在 1-20 之间，或留空自动判断")
+    return value
+
+
 # ---------------------------------------------------------------------------
 # 响应模型
 # ---------------------------------------------------------------------------
@@ -735,9 +750,17 @@ app = FastAPI(
 async def upload(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
-    speakers: int | None = Form(None, ge=1, le=20, description="已知说话人数，留空自动判断"),
+    # 声明成 str 而不是 int：Swagger UI 对 integer 字段一定会预填（minimum 或 0），
+    # 会把「留空」变成一次真实的人数为 1/0 的请求；字符串则靠 default="" 渲染成空框。
+    # 这里再手动解析成 1-20 的整数，空值即交给 pyannote 自动判断。
+    speakers: str | None = Form(
+        None,
+        description="已知说话人数（1-20 的整数），留空自动判断",
+        json_schema_extra={"default": ""},
+    ),
 ) -> UploadResponse:
     _purge_expired()
+    speaker_count = _parse_speakers(speakers)
 
     filename = Path(file.filename or "upload").name
     suffix = Path(filename).suffix.lower()
@@ -758,16 +781,16 @@ async def upload(
             filename=filename,
             source_path=dest,
             size_bytes=size,
-            speaker_count=speakers,
+            speaker_count=speaker_count,
         )
     )
     logger.info(
         "接收上传 %s（%.1f MB）-> 任务 %s（说话人先验=%s）",
-        filename, size / 1e6, task_id, speakers or "自动",
+        filename, size / 1e6, task_id, speaker_count or "自动",
     )
 
     # BackgroundTasks 会在响应返回后执行，run_pipeline 是同步函数，自动进线程池
-    background_tasks.add_task(run_pipeline, task_id, speakers)
+    background_tasks.add_task(run_pipeline, task_id, speaker_count)
 
     return UploadResponse(
         task_id=task_id,
@@ -779,88 +802,12 @@ async def upload(
     )
 
 
-@app.post(
-    "/transcribe/{task_id}",
-    response_model=UploadResponse,
-    status_code=202,
-    summary="重新转录已上传的媒体",
-    description="对同一任务的原始上传文件重新执行转录。",
-)
-def retranscribe_task(task_id: str, background_tasks: BackgroundTasks) -> UploadResponse:
-    """用已上传的媒体重新转录。
-
-    仅适用于通过 `/upload` 创建、且原始文件仍在的任务；导入转录 JSON 的任务
-    没有媒体文件，只能使用 `/summarize`。
-    """
-    record = _get(task_id)
-    if record is None:
-        raise HTTPException(status_code=404, detail=f"任务不存在：{task_id}")
-    if record.status not in {TaskStatus.FAILED, TaskStatus.TRANSCRIBED, TaskStatus.COMPLETED}:
-        raise HTTPException(
-            status_code=409,
-            detail=f"任务正在处理中（{record.status.value}），请稍后再试",
-        )
-    if record.source_path == settings.transcript_path(task_id):
-        raise HTTPException(
-            status_code=409, detail="该任务没有原始媒体文件，无法重新转录"
-        )
-    if not record.source_path.exists():
-        raise HTTPException(
-            status_code=410, detail="原始上传文件已被清理，请重新上传"
-        )
-
-    _update(
-        task_id,
-        force=True,
-        status=TaskStatus.QUEUED,
-        progress=0.0,
-        detail="已重新排队",
-        error=None,
-        finished_at=None,
-        summary_path=None,
-        result=None,
-    )
-    background_tasks.add_task(run_pipeline, task_id, record.speaker_count)
-    logger.info("任务 %s 收到重新转录请求（%s）", task_id, record.filename)
-    return UploadResponse(
-        task_id=task_id,
-        status=TaskStatus.QUEUED,
-        filename=record.filename,
-        size_bytes=record.size_bytes,
-        status_url=f"/status/{task_id}",
-        result_url=f"/result/{task_id}",
-    )
-
-
 @app.get("/status/{task_id}", response_model=TaskStatusResponse, summary="查询任务状态")
 def get_status(task_id: str) -> TaskStatusResponse:
     record = _get(task_id)
     if record is None:
         raise HTTPException(status_code=404, detail=f"任务不存在：{task_id}")
     return TaskStatusResponse(**record.to_dict())
-
-
-@app.get("/result/{task_id}", summary="下载 Markdown 总结")
-def get_result(task_id: str) -> FileResponse:
-    record = _get(task_id)
-    if record is None:
-        raise HTTPException(status_code=404, detail=f"任务不存在：{task_id}")
-    if record.status == TaskStatus.TRANSCRIBED:
-        raise HTTPException(
-            status_code=409,
-            detail=f"尚未生成总结，请先调用 POST /summarize/{task_id}",
-        )
-    if record.status != TaskStatus.COMPLETED:
-        raise HTTPException(status_code=409, detail=f"任务尚未完成（当前状态：{record.status.value}）")
-
-    path = record.summary_path or settings.summary_path(task_id)
-    if not Path(path).exists():
-        raise HTTPException(status_code=410, detail="总结文件已被清理")
-    return FileResponse(
-        path,
-        media_type="text/markdown; charset=utf-8",
-        filename=f"summary-{task_id}.md",
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -938,6 +885,29 @@ def trigger_summarize(task_id: str, background_tasks: BackgroundTasks) -> Summar
     )
 
 
+@app.get("/result/{task_id}", summary="下载 Markdown 总结")
+def get_result(task_id: str) -> FileResponse:
+    record = _get(task_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail=f"任务不存在：{task_id}")
+    if record.status == TaskStatus.TRANSCRIBED:
+        raise HTTPException(
+            status_code=409,
+            detail=f"尚未生成总结，请先调用 POST /summarize/{task_id}",
+        )
+    if record.status != TaskStatus.COMPLETED:
+        raise HTTPException(status_code=409, detail=f"任务尚未完成（当前状态：{record.status.value}）")
+
+    path = record.summary_path or settings.summary_path(task_id)
+    if not Path(path).exists():
+        raise HTTPException(status_code=410, detail="总结文件已被清理")
+    return FileResponse(
+        path,
+        media_type="text/markdown; charset=utf-8",
+        filename=f"summary-{task_id}.md",
+    )
+
+
 @app.post(
     "/summarize",
     response_model=SummarizeResponse,
@@ -996,6 +966,59 @@ async def summarize_import(
         status_url=f"/status/{task_id}",
         result_url=f"/result/{task_id}",
         note="已导入转录文件，开始生成总结",
+    )
+
+
+@app.post(
+    "/transcribe/{task_id}",
+    response_model=UploadResponse,
+    status_code=202,
+    summary="重新转录已上传的媒体",
+    description="对同一任务的原始上传文件重新执行转录。",
+)
+def retranscribe_task(task_id: str, background_tasks: BackgroundTasks) -> UploadResponse:
+    """用已上传的媒体重新转录。
+
+    仅适用于通过 `/upload` 创建、且原始文件仍在的任务；导入转录 JSON 的任务
+    没有媒体文件，只能使用 `/summarize`。
+    """
+    record = _get(task_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail=f"任务不存在：{task_id}")
+    if record.status not in {TaskStatus.FAILED, TaskStatus.TRANSCRIBED, TaskStatus.COMPLETED}:
+        raise HTTPException(
+            status_code=409,
+            detail=f"任务正在处理中（{record.status.value}），请稍后再试",
+        )
+    if record.source_path == settings.transcript_path(task_id):
+        raise HTTPException(
+            status_code=409, detail="该任务没有原始媒体文件，无法重新转录"
+        )
+    if not record.source_path.exists():
+        raise HTTPException(
+            status_code=410, detail="原始上传文件已被清理，请重新上传"
+        )
+
+    _update(
+        task_id,
+        force=True,
+        status=TaskStatus.QUEUED,
+        progress=0.0,
+        detail="已重新排队",
+        error=None,
+        finished_at=None,
+        summary_path=None,
+        result=None,
+    )
+    background_tasks.add_task(run_pipeline, task_id, record.speaker_count)
+    logger.info("任务 %s 收到重新转录请求（%s）", task_id, record.filename)
+    return UploadResponse(
+        task_id=task_id,
+        status=TaskStatus.QUEUED,
+        filename=record.filename,
+        size_bytes=record.size_bytes,
+        status_url=f"/status/{task_id}",
+        result_url=f"/result/{task_id}",
     )
 
 
