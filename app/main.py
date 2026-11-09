@@ -253,6 +253,9 @@ def _summary_result(
         "speakers": transcribed.get("speakers", []),
         "speaker_stats": transcribed.get("speaker_stats", []),
         "language": transcribed.get("language"),
+        # 片内语言细分结果与重叠语音统计（便于排查多语种识别）
+        "language_spans": transcribed.get("language_spans", []),
+        "overlap_segments": transcribed.get("overlap_segments", 0),
         "diarized": bool(summary["meta"].get("diarized")),
         "speaker_mode": summary["meta"].get("speaker_mode"),
         "diarization": transcribed.get("diarization"),
@@ -275,6 +278,8 @@ def _transcribed_result(
         "speakers": transcribed.get("speakers", []),
         "speaker_stats": transcribed.get("speaker_stats", []),
         "language": transcribed.get("language"),
+        "language_spans": transcribed.get("language_spans", []),
+        "overlap_segments": transcribed.get("overlap_segments", 0),
         "diarized": bool(transcribed.get("diarized")),
         "diarization": transcribed.get("diarization"),
         "audio_duration_sec": total_audio,

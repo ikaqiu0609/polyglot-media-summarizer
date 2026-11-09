@@ -692,21 +692,33 @@ data/
 
 ```json
 {
-  "language": "en",
-  "chunk_languages": ["en", "en", "ja"],
-  "segments": [{"start": 12.34, "end": 18.9, "speaker": "Speaker 1", "text": "..."}],
+  "language": "multilingual",
+  "chunk_languages": ["ja", "en", "en"],
+  "language_spans": [
+    {"start": 1198.7, "end": 1260.0, "language": "ja", "confidence": 0.93, "segments": 6},
+    {"start": 1260.0, "end": 1800.0, "language": "en", "confidence": 0.99, "segments": 29}
+  ],
+  "segments": [
+    {"start": 12.34, "end": 18.9, "speaker": "Speaker 1", "text": "..."},
+    {"start": 1261.8, "end": 1276.1, "speaker": "Speaker 1",
+     "speakers": ["Speaker 1", "Speaker 2"], "overlap": true, "text": "..."}
+  ],
   "speakers": ["Speaker 1", "Speaker 2"],
   "speaker_stats": [{"speaker": "Speaker 1", "seconds": 320.5, "turns": 42}],
   "num_segments": 128,
+  "overlap_segments": 3,
   "duration_sec": 3721.5,
   "diarized": true,
   "diarization": {"requested": true, "ok": true, "input_mode": "waveform", "reason": null},
   "speech_ratio": 0.72,
   "peak_vram_mb": 5217.0,
-  "chunks": [{"index": 0, "start": 0.0, "duration": 600.0, "language": "en", "segments": 22}],
+  "chunks": [{"index": 0, "start": 0.0, "duration": 600.0, "span": 0, "language": "ja", "segments": 22}],
   "elapsed_sec": 412.7
 }
 ```
+
+- `language_spans`：片内语言细分的最终结果；`language` 在跨语种时写 `multilingual`。
+- `speakers` / `overlap`（segment 级）：仅重叠语音段出现，表示这几位说话人在同一时间段同时说话；文本本身仍是合并结果。
 
 ---
 
@@ -777,8 +789,16 @@ python -m app.services.summarizer ./demo.json --out ./summary.md
 | `VAD_METHOD` | `silero` | 免额外许可，但首次要从 GitHub（torch.hub）下载，网络受限时改 `pyannote`（走 HF，需接受 `segmentation-3.0` 条款）；silero 失败会自动回退 pyannote 重试一次 |
 | `ASR_ALIGN` | `1` | 词级对齐开关（`0` 关闭）。对齐只用于「按说话人拆段」，没有说话人标签时一律跳过 |
 | `ASR_OFFLINE` | `auto` | `auto`=联网失败时自动切 HF 离线模式重试一次；`1`=始终离线（模型已缓存时更快）；`0`=始终联网 |
-| `ASR_LANG_VOTE_SAMPLES` | `3` | 前 N 个「有语音」切片参与语言投票 |
-| `ASR_LANG_MIN_SHARE` | `0.8` | 某语言占比达到该阈值才锁定全局语言；多语内容/平票继续逐片检测，顶层 `language` 写 `multilingual` |
+| `ASR_LANG_VOTE_SAMPLES` / `ASR_LANG_MIN_SHARE` | `3` / `0.8` | 前 N 个「有语音」切片参与语言投票；只用于统计顶层 `language`（多语时写 `multilingual`） |
+| `ASR_LANG_LOCK` | `0` | `1`=恢复旧行为：某语言占比达标后锁定并强制后续切片单语（多语种采访不建议开启） |
+| `ASR_LANG_SPAN` | `1` | 片内语言细分开关。滑窗检测语言，在变化处把切片再切成子片，子片各自解码/对齐 |
+| `ASR_LANG_PROBE_SEC` | `25` | 语言探测窗口（秒）。太短边界模糊，太长会跨语种 |
+| `ASR_LANG_SPAN_MAX` / `ASR_LANG_SPAN_MIN` | `90` / `8` | 单个语言子片的上下限（秒） |
+| `ASR_LANG_MIN_CONF` | `0.55` | `detect_language` 置信度下限，低于它交给上下文推断/whisper 自己判断 |
+| `ASR_LANG_SNAP_WINDOW` / `ASR_LANG_MIN_CHUNK_SEC` | `6` / `45` | 子片边界吸附静音的半径；切片短于该值不做细分 |
+| `ASR_LANG_MAX_PARTS` | `6` | 单切片最多切出多少语言子片；超过说明是 BGM/噪声导致检测抖动，退回整片 |
+| `ASR_OVERLAP` | `1` | 重叠语音标注开关。开启后重叠段带 `speakers=[...]` 与 `overlap=true` |
+| `ASR_OVERLAP_MIN_RATIO` | `0.15` | 某说话人覆盖 segment 时长达该比例才算「同时说话」 |
 | `DIARIZATION_MODEL` | `pyannote/speaker-diarization-3.1` | 需 Agree 的模型见 [模型授权](#模型授权必读) |
 | `DIAR_AUDIO_INPUT` | `waveform` | `waveform`=自己解码 16k wav 传入（不依赖 torchcodec，推荐）；`path`=把路径交给 pyannote（需 torchcodec 与 torch 版本匹配 + 共享版 FFmpeg） |
 | `ENABLE_DIARIZATION` | `true` | 关掉则只转录、不打说话人标签（可省 HF_TOKEN） |
@@ -891,15 +911,33 @@ BGM、音效、多人重叠说话会让 pyannote 3.1 过度聚类。本项目已
 <details>
 <summary><b>韩语/日语片段被识别成英文</b></summary>
 
-`auto` 模式下语言是**逐片**检测的（不是整段一次）。前 3 个「有语音」切片投票，只有某个语言占比 ≥ `ASR_LANG_MIN_SHARE`（默认 0.8）才锁定并固定传给后续切片；多语内容或平票则继续逐片检测，顶层 `language` 写成 `multilingual`，每个切片的判定结果记录在 `transcript.json` 的 `chunk_languages` 里。
+先确认是哪一层的问题，看 `transcript.json` 里的 `language_spans`：每个语言子片都记录了 `start` / `end` / `language` / `confidence`。
 
-如果内容语言已知，直接指定更稳妥：
+- **整片都被判错**：whisper 的语言检测只看开头 30 秒。如果开头是英语、后面才是日语，检测结果就会偏向英语。
+- **片内一部分错**：这是「一个切片只有一种语言」的限制。默认已开启 `ASR_LANG_SPAN=1`：每 25 秒滑窗检测一次语言，在语言变化处把切片再切成子片（上限 90 秒），每个子片用自己的语言解码与对齐。日志里会打印 `切片 N 语言细分：0~50s=ja，50~90s=en`。
+- **语言检测本身不靠谱**：调低 `ASR_LANG_MIN_CONF`（更信任检测）或调高（更依赖 whisper 自己判断）；把 `ASR_LANG_PROBE_SEC` 调到 15~20 秒能让边界更细，代价是多几次检测。
+
+如果内容语言已知，直接指定最稳（会关闭片内细分）：
 
 ```ini
 ASR_LANGUAGE=ko
 ```
 
-这样所有切片都不会再做语言检测，也省掉每片的检测开销。
+`ASR_LANG_LOCK` 默认 `0`：投票只统计主导语言，不会把「锁定语言」强加给后续切片。多语种采访不要开成 `1`。
+</details>
+
+<details>
+<summary><b>两个人同时说话，能分开吗？</b></summary>
+
+能检出、不能自动拆分。`ASR_OVERLAP=1`（默认）时，pyannote 的重叠 turns 会被保留，重叠段的 segment 额外带：
+
+```json
+{"speaker": "Speaker 1", "speakers": ["Speaker 1", "Speaker 2"], "overlap": true, "text": "..."}
+```
+
+总结阶段会把这类行写成 `Speaker 1 + Speaker 2（同时说话）`，不会把内容误记到一个人头上。
+
+但**把重叠语音的文本拆成两条**需要额外的声源分离模型（如 pyannote/separator、MossFormer2），单声道混音在 8GB 显存上跑不动，本项目暂不包含。当前能力是：检测到重叠 → 标注多说话人 → 尽量按语言切分，文本仍是一段合并结果。
 </details>
 
 <details>

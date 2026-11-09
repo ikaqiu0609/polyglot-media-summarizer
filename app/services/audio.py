@@ -371,14 +371,18 @@ def extract_audio(
 # ---------------------------------------------------------------------------
 # 切片
 # ---------------------------------------------------------------------------
-def _snap_to_silence(
+def snap_to_silence(
     target: float,
     silences: Sequence[tuple[float, float]],
     window: float,
     lower: float,
     upper: float,
 ) -> float:
-    """把切点吸附到 window 内最近的静音中点；找不到就返回原始切点。"""
+    """把切点吸附到 window 内最近的静音中点；找不到就返回原始切点。
+
+    公开给 transcribe 的「片内语言分段」复用：语言边界切在静音处，
+    才不会把一句话切成两半。
+    """
     if not silences or window <= 0:
         return target
 
@@ -415,7 +419,7 @@ def plan_chunks(
     boundaries: list[float] = [0.0]
     for i in range(1, count):
         target = round(i * chunk_seconds, 3)
-        snapped = _snap_to_silence(
+        snapped = snap_to_silence(
             target,
             silences or (),
             snap_window,

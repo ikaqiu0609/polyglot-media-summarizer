@@ -636,6 +636,158 @@ def test_meta_line_replaces_model_written_meta() -> None:
     assert "Speaker 1 100%" in out
 
 
+# ---------------------------------------------------------------------------
+# transcribe: 片内语言细分 / 重叠语音
+# ---------------------------------------------------------------------------
+def test_language_windows_single_language_not_split() -> None:
+    spans = transcribe.merge_language_windows(
+        [
+            transcribe.LanguageWindow(0, 25, "ja", 0.9),
+            transcribe.LanguageWindow(25, 50, "ja", 0.95),
+        ]
+    )
+    assert len(spans) == 1
+    assert (spans[0].start, spans[0].end, spans[0].language) == (0, 50, "ja")
+
+
+def test_language_windows_multilingual_boundaries() -> None:
+    spans = transcribe.merge_language_windows(
+        [
+            transcribe.LanguageWindow(0, 25, "ja", 0.93),
+            transcribe.LanguageWindow(25, 50, "ja", 0.9),
+            transcribe.LanguageWindow(50, 75, "en", 0.99),
+            transcribe.LanguageWindow(75, 100, "ja", 0.88),
+        ]
+    )
+    assert [(s.start, s.end, s.language) for s in spans] == [
+        (0, 50, "ja"),
+        (50, 75, "en"),
+        (75, 100, "ja"),
+    ]
+
+
+def test_language_windows_low_confidence_uses_context() -> None:
+    spans = transcribe.merge_language_windows(
+        [
+            transcribe.LanguageWindow(0, 25, None, 0.2),
+            transcribe.LanguageWindow(25, 50, "en", 0.9),
+            transcribe.LanguageWindow(50, 75, None, 0.3),
+        ]
+    )
+    assert [(s.start, s.end, s.language) for s in spans] == [(0, 75, "en")]
+
+
+def test_language_windows_long_spans_split_only_when_mixed() -> None:
+    mixed = transcribe.merge_language_windows(
+        [
+            transcribe.LanguageWindow(0, 100, "ja", 0.9),
+            transcribe.LanguageWindow(100, 200, "en", 0.9),
+        ],
+        max_span_sec=90,
+    )
+    assert [s.language for s in mixed] == ["ja", "ja", "en", "en"]
+    assert all(s.duration <= 90 for s in mixed)
+
+    single = transcribe.merge_language_windows(
+        [
+            transcribe.LanguageWindow(0, 100, "ja", 0.9),
+            transcribe.LanguageWindow(100, 400, "ja", 0.9),
+        ]
+    )
+    assert len(single) == 1
+    assert single[0].duration == 400
+
+
+def test_speakers_for_span_keeps_overlap() -> None:
+    turns = [
+        transcribe.DiarTurn(0, 5, "SPEAKER_00"),
+        transcribe.DiarTurn(2, 5, "SPEAKER_01"),
+    ]
+    assert transcribe._speakers_for_span(0, 5, turns) == ["SPEAKER_00", "SPEAKER_01"]
+    assert transcribe._speakers_for_span(0, 1, turns) == ["SPEAKER_00"]
+
+    seg = transcribe._apply_speaker_fields({"start": 2, "end": 5, "text": "x"}, turns)
+    assert seg["speaker"] == "SPEAKER_00"
+    assert seg["overlap"] is True
+    assert seg["speakers"] == ["SPEAKER_00", "SPEAKER_01"]
+
+
+def test_postprocess_does_not_merge_overlap() -> None:
+    merged = transcribe.postprocess_segments(
+        [
+            {
+                "start": 0,
+                "end": 5,
+                "speaker": "Speaker 1",
+                "text": "a",
+                "overlap": True,
+                "speakers": ["Speaker 1", "Speaker 2"],
+            },
+            {"start": 5.2, "end": 8, "speaker": "Speaker 1", "text": "b"},
+        ],
+        gap_sec=0.8,
+    )
+    assert len(merged) == 2
+    assert merged[0]["overlap"] is True
+    assert merged[0]["speakers"] == ["Speaker 1", "Speaker 2"]
+
+
+def test_join_words_merges_char_level_latin() -> None:
+    # 用错语言的对齐模型会把英文切成单字符 token（H e l l o）
+    assert transcribe._join_words([{"word": ch} for ch in "Hello"]) == "Hello"
+    assert transcribe._join_words([{"word": "你好"}, {"word": "世界"}]) == "你好世界"
+    assert transcribe._join_words([{"word": " Hello"}, {"word": " world"}]) == "Hello world"
+
+
+def test_filter_hallucinations_drops_ngram_repeat() -> None:
+    # BGM / 语言错配时的段内循环：不依赖 compression_ratio 字段
+    repeated = "については" * 20
+    normal = "今天我们讨论了新版本的发布时间、角色平衡以及下个赛季的改动方向"
+    kept = transcribe._filter_hallucinations([{"text": repeated}, {"text": normal}])
+    assert len(kept) == 1
+    assert kept[0]["text"] == normal
+
+
+def test_filter_hallucinations_keeps_short_repeats() -> None:
+    # 短寒暄的重复（はい / OK）不应被当成幻觉
+    kept = transcribe._filter_hallucinations([{"text": "はい"}, {"text": "はい"}])
+    assert len(kept) == 2
+
+
+def test_format_segment_marks_overlap() -> None:
+    line = summarizer.format_segment(
+        {
+            "start": 65,
+            "speaker": "Speaker 1",
+            "speakers": ["Speaker 1", "Speaker 2"],
+            "overlap": True,
+            "text": "两个人同时说话",
+        }
+    )
+    assert "Speaker 1 + Speaker 2（同时说话）" in line
+
+
+def test_normalize_payload_keeps_overlap_fields() -> None:
+    payload = summarizer.normalize_payload(
+        {
+            "segments": [
+                {
+                    "start": 1,
+                    "end": 2,
+                    "speaker": "Speaker 1",
+                    "text": "x",
+                    "speakers": ["Speaker 1", "Speaker 2"],
+                    "overlap": True,
+                }
+            ]
+        }
+    )
+    seg = payload["segments"][0]
+    assert seg["speakers"] == ["Speaker 1", "Speaker 2"]
+    assert seg["overlap"] is True
+    assert payload["speakers"] == ["Speaker 1", "Speaker 2"]
+
+
 if __name__ == "__main__":
     failures = 0
     for name, func in sorted(globals().items()):

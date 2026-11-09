@@ -5,10 +5,15 @@
        否则每片独立聚类，SPEAKER_00 在片与片之间根本不指同一个人；
     2. 立即释放 pyannote 管线，再加载 murmurai（WhisperX fork）的 ASR 模型：
        两个模型不同时常驻，8GB 卡上换 large-v3 才留得下余量；
-    3. 逐片转录（切片信息来自 audio.py），把结果时间戳加回全局偏移；
-    4. 用 word 级时间戳把跨说话人的 segment 拆开，再按说话人合并；
-    5. 跨片边界做「同说话人 + 间隙很小」的合并，并去除切点重复文本；
-    6. finally 里 del 模型 + torch.cuda.empty_cache() 释放显存。
+    3. **片内语言细分**：对每个切片用 detect_language 每 25s 滑窗探测，
+       在语种变化处把切片再切成语言子片（上限 90s）。Whisper 的 language
+       参数对整段生效，不细分的话「600s 片内先日语后英语」会把英语段
+       按日语解码（假名 / 字符级拉丁字母 / 复读）；
+    4. 逐子片转录与对齐（切片信息来自 audio.py），时间戳加回全局偏移；
+    5. 用 word 级时间戳把跨说话人的 segment 拆开，再按说话人合并；
+       重叠语音段额外保留 speakers=[...] / overlap=true；
+    6. 跨片边界做「同说话人 + 间隙很小」的合并，并去除切点重复文本；
+    7. finally 里 del 模型 + torch.cuda.empty_cache() 释放显存。
 
 关于库 API 的不确定性（重要，读代码前先看）：
     - murmurai-core 与 whisperx 的 API 完全一致，但 3.2/3.3 之间参数名有漂移
@@ -32,6 +37,7 @@ import gc
 import inspect
 import json
 import logging
+import math
 import os
 import time
 import warnings
@@ -42,7 +48,20 @@ from typing import Any, Callable, Sequence
 
 import torch
 
-from app.services.audio import AudioChunk, analyze, cleanup, probe_duration
+from app.services.audio import (
+    AudioChunk,
+    SAMPLE_RATE,
+    analyze,
+    cleanup,
+    probe_duration,
+    probe_silences,
+    snap_to_silence,
+)
+
+try:  # 片内语言细分要按窗口读 PCM；soundfile 缺失时自动退回「整片一种语言」
+    import soundfile as sf
+except ImportError:  # pragma: no cover - requirements 里已声明，仅防御性分支
+    sf = None  # type: ignore[assignment]
 
 # torch 2.9 起旧的 TF32 开关被弃用，pyannote / lightning 仍在读它，每次启动都会刷一条
 # UserWarning。只按 message 精确屏蔽这一条（torchcodec / HF 权限等警告必须保留）。
@@ -129,6 +148,11 @@ MAX_MERGED_SEC = float(os.getenv("MAX_MERGED_SEC", "60"))        # 合并后单�
 HALLU_NO_SPEECH_PROB = float(os.getenv("HALLU_NO_SPEECH_PROB", "0.6"))
 HALLU_AVG_LOGPROB = float(os.getenv("HALLU_AVG_LOGPROB", "-1.0"))
 HALLU_COMPRESSION_RATIO = float(os.getenv("HALLU_COMPRESSION_RATIO", "2.4"))
+# 段内复读检测（不依赖库字段）：语言错配/BGM 时 whisper 常输出
+# 「Xについては、Xについては…」式循环，而 murmurai 不一定带 compression_ratio。
+HALLU_REPEAT_NGRAM = max(3, int(os.getenv("HALLU_REPEAT_NGRAM", "6")))
+HALLU_REPEAT_COUNT = max(2, int(os.getenv("HALLU_REPEAT_COUNT", "5")))
+HALLU_REPEAT_MIN_CHARS = max(20, int(os.getenv("HALLU_REPEAT_MIN_CHARS", "80")))
 
 # 前 N 个「有语音」的切片各投一票决定全局语言，之后固定传给所有切片。
 # 逐片 auto 检测会让同一文件的语言来回跳（例如前 20 分钟被判成 en、之后是 ko）。
@@ -136,6 +160,48 @@ LANG_VOTE_SAMPLES = max(1, int(os.getenv("ASR_LANG_VOTE_SAMPLES", "3")))
 # 只有当某个语言占比达到该阈值时才锁定；多语内容/平票继续逐片检测。
 # 误锁的代价远大于每片多一次语言检测（约 1~2s），所以默认取 0.8。
 LANG_VOTE_MIN_SHARE = float(os.getenv("ASR_LANG_MIN_SHARE", "0.8"))
+# P1：投票只用于统计顶层 language，不再把结果强制回灌给后续切片。
+# Whisper 的 language 参数是「整片一个语言」，一旦锁死，后面再出现的另一种
+# 语言就会被按错误语言解码（日语片里的英语会变成假名/字符级拉丁字母）。
+LANG_VOTE_LOCK = (os.getenv("ASR_LANG_LOCK", "0") or "0").strip().lower() not in {
+    "0", "false", "no", "off",
+}
+
+# ---------------------------------------------------------------------------
+# 片内语言细分（多语种采访的核心）
+# ---------------------------------------------------------------------------
+# Whisper 系列的 language 参数是整段生效的：600s 切片里只要跨一次语种，
+# 后半段就会被按前半段的语言解码。这里在解码前先用 detect_language 做滑窗
+# 探测，把切片再切成「语言连续」的子片，每个子片用自己的语言解码/对齐。
+LANG_SPAN_ENABLED = (os.getenv("ASR_LANG_SPAN", "1") or "1").strip().lower() not in {
+    "0", "false", "no", "off",
+}
+# 语言探测窗口：25s 足够 whisper 判断语种，又不会把边界模糊掉
+LANG_PROBE_SEC = max(8.0, float(os.getenv("ASR_LANG_PROBE_SEC", "25")))
+# 单个语言子片的上限：太长会重新引入「片内跨语种」，太短则上下文不足
+LANG_SPAN_MAX_SEC = max(30.0, float(os.getenv("ASR_LANG_SPAN_MAX", "90")))
+# 短于该值的同语种子片并入邻居，避免把一句寒暄切成独立子片
+LANG_SPAN_MIN_SEC = max(2.0, float(os.getenv("ASR_LANG_SPAN_MIN", "8")))
+# detect_language 的置信度下限：低于它视为「本窗口语言不可信」，交给上下文推断
+LANG_SPAN_MIN_CONF = min(0.99, max(0.2, float(os.getenv("ASR_LANG_MIN_CONF", "0.55"))))
+# 子片边界吸附静音的半径（秒）
+LANG_SPAN_SNAP_WINDOW = max(0.0, float(os.getenv("ASR_LANG_SNAP_WINDOW", "6")))
+# 整片短于该值时没必要再细分（一次转完更准）
+LANG_SPAN_MIN_CHUNK_SEC = max(30.0, float(os.getenv("ASR_LANG_MIN_CHUNK_SEC", "45")))
+# 单切片最多切出多少个子片：超过说明是 BGM/噪声导致语言检测抖动，退回整片
+LANG_SPAN_MAX_PARTS = max(2, int(os.getenv("ASR_LANG_MAX_PARTS", "6")))
+
+# ---------------------------------------------------------------------------
+# 重叠语音（多人同时说话）
+# ---------------------------------------------------------------------------
+# pyannote 的 Annotation 本身允许重叠 turns。开启后，一个 segment 若被两位
+# 以上说话人覆盖，会额外带 speakers=[...] 与 overlap=true（文本无法分离，
+# 但下游总结能知道这句是「几个人同时在说」，不会把内容误记到一个人头上）。
+OVERLAP_ENABLED = (os.getenv("ASR_OVERLAP", "1") or "1").strip().lower() not in {
+    "0", "false", "no", "off",
+}
+# 某说话人覆盖 segment 时长达到该比例才算「同时说话」，避免把换人瞬间标成重叠
+OVERLAP_MIN_RATIO = min(0.9, max(0.05, float(os.getenv("ASR_OVERLAP_MIN_RATIO", "0.15"))))
 
 ASR_OPTIONS: dict[str, Any] = {
     # 长音频 + 无重叠切片场景下，关闭上文条件可显著减少重复输出
@@ -163,6 +229,34 @@ class DiarTurn:
         return max(0.0, self.end - self.start)
 
 
+@dataclass
+class LanguageWindow:
+    """一次语言探测的结果（时间相对所属切片）。"""
+
+    start: float
+    end: float
+    language: str | None
+    confidence: float = 0.0
+
+    @property
+    def duration(self) -> float:
+        return max(0.0, self.end - self.start)
+
+
+@dataclass
+class LanguageSpan:
+    """一个语言连续的片段（时间相对所属切片），用于驱动子片转录。"""
+
+    start: float
+    end: float
+    language: str | None
+    confidence: float = 0.0
+
+    @property
+    def duration(self) -> float:
+        return max(0.0, self.end - self.start)
+
+
 # ---------------------------------------------------------------------------
 # 通用小工具
 # ---------------------------------------------------------------------------
@@ -178,6 +272,10 @@ _ALIGN_UNAVAILABLE: set[str] = set()
 _DIAR_UNAVAILABLE: str = ""
 # 最近一次分离失败的原因（含临时错误），用于 /healthz 与 transcript.json 的可诊断性
 _DIAR_LAST_ERROR: str = ""
+# detect_language 不可用/连续失败的原因：非空表示本进程不再做片内语言细分
+_LANG_DETECT_UNAVAILABLE: str = ""
+# 连续失败次数（偶发的单窗异常不足以禁用整个机制）
+_LANG_DETECT_FAILURES: int = 0
 
 
 def _clear_align_cache() -> None:
@@ -716,6 +814,324 @@ def _speaker_stats(
 
 
 # ---------------------------------------------------------------------------
+# 片内语言细分（纯规划逻辑 + 音频切片）
+# ---------------------------------------------------------------------------
+def merge_language_windows(
+    windows: Sequence[LanguageWindow],
+    max_span_sec: float = LANG_SPAN_MAX_SEC,
+    min_span_sec: float = LANG_SPAN_MIN_SEC,
+) -> list[LanguageSpan]:
+    """纯函数：语言探测窗口 -> 语言连续片段。
+
+    规则：
+        1. 低置信/未知窗口用前后最近的已知语言补齐（开头向前、结尾向后）；
+        2. 相邻同语言窗口合并；
+        3. 只有「片内确实出现多种语言」时才把超长片段按 max_span_sec 拆开
+           （单一语言整片不拆，避免无谓地把一次转录变多次）；
+        4. 短于 min_span_sec 的碎片优先并入同语言邻居，没有同语言邻居则保留。
+
+    单独抽成纯函数是为了能脱离音频做单元测试。
+    """
+    items = [w for w in windows if w.end > w.start]
+    if not items:
+        return []
+
+    # ---- 1. 补齐未知语言 ----
+    raw_languages: list[str | None] = [w.language for w in items]
+    forward: list[str | None] = []
+    last: str | None = None
+    for lang in raw_languages:
+        if lang:
+            last = lang
+        forward.append(last)
+    backward: list[str | None] = [None] * len(raw_languages)
+    nxt: str | None = None
+    for i in range(len(raw_languages) - 1, -1, -1):
+        if raw_languages[i]:
+            nxt = raw_languages[i]
+        backward[i] = nxt
+    # 前向优先（沿用上一窗语言）；开头一段未知时回退到后面第一个已知语言
+    languages = [f if f is not None else b for f, b in zip(forward, backward)]
+
+    # ---- 2. 相邻同语言合并 ----
+    merged: list[LanguageSpan] = []
+    for window, lang in zip(items, languages):
+        if merged and merged[-1].language == lang and abs(merged[-1].end - window.start) < 1e-6:
+            merged[-1].end = window.end
+            merged[-1].confidence = max(merged[-1].confidence, window.confidence)
+        else:
+            merged.append(LanguageSpan(window.start, window.end, lang, window.confidence))
+
+    # 片内只有一种语言：不拆分（保持与改造前一致的「一次转录」路径）
+    if len(merged) <= 1:
+        span = merged[0] if merged else LanguageSpan(items[0].start, items[-1].end, None, 0.0)
+        return [
+            LanguageSpan(
+                round(items[0].start, 3),
+                round(items[-1].end, 3),
+                span.language,
+                span.confidence,
+            )
+        ]
+
+    # ---- 3. 超长片段按上限拆分（只发生在多语切片内）----
+    split: list[LanguageSpan] = []
+    for span in merged:
+        if span.duration <= max_span_sec:
+            split.append(span)
+            continue
+        parts = max(1, math.ceil(span.duration / max_span_sec))
+        step = span.duration / parts
+        cursor = span.start
+        for index in range(parts):
+            end = span.end if index == parts - 1 else round(span.start + step * (index + 1), 3)
+            split.append(LanguageSpan(round(cursor, 3), end, span.language, span.confidence))
+            cursor = end
+
+    # ---- 4. 短碎片不硬吞 ----
+    # 相邻同语言窗口在第 2 步已经合并；这里不能再合并，否则刚按 max_span
+    # 拆开的长片段会被重新粘回去。不同语言的短段就是真正的语种切换点，保留。
+    result: list[LanguageSpan] = []
+    for span in split:
+        if span.duration < min_span_sec and len(split) > 1:
+            logger.debug(
+                "语言碎片 %.1f~%.1fs（%s，%.1fs）保留", span.start, span.end, span.language, span.duration
+            )
+        result.append(span)
+
+    # 兜底：确保单调、无重叠、无 0 长度片段
+    cleaned: list[LanguageSpan] = []
+    for span in result:
+        start = max(0.0, span.start)
+        end = max(start, span.end)
+        if end - start < 0.2:
+            continue
+        if cleaned and start < cleaned[-1].end:
+            start = cleaned[-1].end
+        if end - start < 0.2:
+            continue
+        cleaned.append(LanguageSpan(round(start, 3), round(end, 3), span.language, span.confidence))
+    return cleaned
+
+
+def _read_waveform_span(path: Path, start_sec: float, duration_sec: float) -> Any:
+    """读取 PCM wav 的一段为 float32 单声道波形（供 detect_language 使用）。"""
+    if sf is None:
+        return None
+    try:
+        frames = max(1, int(round(duration_sec * SAMPLE_RATE)))
+        start_frame = max(0, int(round(start_sec * SAMPLE_RATE)))
+        data, rate = sf.read(
+            str(path),
+            start=start_frame,
+            frames=frames,
+            dtype="float32",
+            always_2d=False,
+        )
+    except Exception as exc:  # noqa: BLE001 - 读失败不应该中断转录
+        logger.debug("读取音频片段失败（%s @ %.1fs）: %s", path.name, start_sec, exc)
+        return None
+    if rate != SAMPLE_RATE or data is None or len(data) == 0:
+        return None
+    if getattr(data, "ndim", 1) > 1:
+        data = data.mean(axis=1)
+    return data
+
+
+def _is_silent_waveform(waveform: Any, threshold: float = 1e-3) -> bool:
+    """近似 -60dBFS：静音窗口不该拿去判语言（whisper 对静音也会硬猜一个）。"""
+    try:
+        return float(abs(waveform).max()) < threshold
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def probe_language(model: Any, waveform: Any) -> tuple[str | None, float]:
+    """对一段波形做语言检测，返回 (语言, 置信度)；任何异常都退化为未知。
+
+    murmurai（whisperx fork）继承 faster-whisper 的 detect_language，
+    但不同版本参数名/返回值有差异，这里做兼容解析。
+    """
+    global _LANG_DETECT_UNAVAILABLE, _LANG_DETECT_FAILURES
+    if _LANG_DETECT_UNAVAILABLE or waveform is None:
+        return None, 0.0
+
+    detector = getattr(model, "detect_language", None)
+    if not callable(detector):
+        _LANG_DETECT_UNAVAILABLE = "当前 murmurai 版本没有 detect_language"
+        logger.warning("%s，片内语言细分已禁用（退回整片一种语言）", _LANG_DETECT_UNAVAILABLE)
+        return None, 0.0
+
+    try:
+        result = detector(**_filter_kwargs(detector, {"audio": waveform, "vad_filter": False}))
+    except TypeError:
+        # 老版本签名是 detect_language(audio, ...)，没有关键字参数名
+        try:
+            result = detector(waveform)
+        except Exception as exc:  # noqa: BLE001
+            return _language_probe_failed(exc)
+    except Exception as exc:  # noqa: BLE001
+        return _language_probe_failed(exc)
+
+    _LANG_DETECT_FAILURES = 0
+    return _parse_language_result(result)
+
+
+def _language_probe_failed(exc: Exception) -> tuple[str | None, float]:
+    global _LANG_DETECT_UNAVAILABLE, _LANG_DETECT_FAILURES
+    _LANG_DETECT_FAILURES += 1
+    if _LANG_DETECT_FAILURES >= 3:
+        _LANG_DETECT_UNAVAILABLE = f"detect_language 连续失败：{type(exc).__name__}: {exc}"[:300]
+        logger.warning(
+            "语言检测连续失败 %d 次，片内语言细分已禁用：%s", _LANG_DETECT_FAILURES, exc
+        )
+    else:
+        logger.debug("语言检测失败（第 %d 次）: %s", _LANG_DETECT_FAILURES, exc)
+    return None, 0.0
+
+
+def _parse_language_result(result: Any) -> tuple[str | None, float]:
+    """兼容 faster-whisper 各版本：tuple(lang, prob, all_probs) 或 dataclass。"""
+    language: str | None = None
+    probability = 0.0
+    if isinstance(result, (tuple, list)):
+        if result and result[0]:
+            language = str(result[0]).lower()
+        if len(result) > 1 and result[1] is not None:
+            try:
+                probability = float(result[1])
+            except (TypeError, ValueError):
+                probability = 0.0
+    else:
+        raw_language = getattr(result, "language", None)
+        if raw_language:
+            language = str(raw_language).lower()
+        try:
+            probability = float(getattr(result, "language_probability", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            probability = 0.0
+    if probability < 0:
+        probability = 0.0
+    if probability > 1:
+        probability = 1.0
+    return language, probability
+
+
+def plan_language_spans(
+    model: Any,
+    chunk: AudioChunk,
+    fixed_lang: str | None = None,
+) -> list[LanguageSpan]:
+    """解码前把切片按语言变化切成子片；返回的时间相对切片起点。
+
+    退化为「整片一种语言」的情况：
+        - 用户显式指定了 ASR_LANGUAGE（fixed_lang 非空）；
+        - 关闭了 ASR_LANG_SPAN，或 soundfile 不可用；
+        - 切片太短（< LANG_SPAN_MIN_CHUNK_SEC），细分反而损失上下文；
+        - 所有窗口语言一致（最常见，保持一次转录，性能不变）。
+    """
+    whole = LanguageSpan(0.0, round(chunk.duration_sec, 3), fixed_lang, 1.0 if fixed_lang else 0.0)
+    if (
+        fixed_lang
+        or not LANG_SPAN_ENABLED
+        or sf is None
+        or chunk.duration_sec < max(LANG_SPAN_MIN_CHUNK_SEC, LANG_PROBE_SEC * 1.5)
+    ):
+        return [whole]
+
+    windows: list[LanguageWindow] = []
+    cursor = 0.0
+    total = chunk.duration_sec
+    while cursor < total - 0.5:
+        remaining = total - cursor
+        length = min(LANG_PROBE_SEC, remaining)
+        if windows and remaining < LANG_PROBE_SEC * 0.5:
+            # 尾巴太短：并进上一个窗口，别用 3 秒音频去判语言
+            windows[-1] = LanguageWindow(
+                windows[-1].start, round(total, 3), windows[-1].language, windows[-1].confidence
+            )
+            break
+        waveform = _read_waveform_span(chunk.path, cursor, length)
+        if waveform is None or _is_silent_waveform(waveform):
+            language, confidence = None, 0.0
+        else:
+            language, confidence = probe_language(model, waveform)
+        windows.append(
+            LanguageWindow(
+                round(cursor, 3),
+                round(min(cursor + length, total), 3),
+                language if confidence >= LANG_SPAN_MIN_CONF else None,
+                confidence,
+            )
+        )
+        cursor += length
+
+    spans = merge_language_windows(windows)
+    if len(spans) <= 1:
+        detected = spans[0].language if spans else None
+        confidence = spans[0].confidence if spans else 0.0
+        # 片内语言一致时也用检测结果：比让 whisper 在全片上再猜一次更准
+        return [
+            LanguageSpan(
+                whole.start,
+                whole.end,
+                detected or fixed_lang,
+                confidence,
+            )
+        ]
+    if len(spans) > LANG_SPAN_MAX_PARTS:
+        # BGM / 噪声会让检测结果来回跳；细分反而把一片音乐切成多种语言去解码
+        logger.warning(
+            "切片 %d 语言检测抖动（%d 个子片，语言 %s），退回整片转录",
+            chunk.index, len(spans), [span.language for span in spans],
+        )
+        return [whole]
+
+    # 子片边界吸附到静音中点，避免从句子中间切开
+    silences = probe_silences(chunk.path) if LANG_SPAN_SNAP_WINDOW > 0 else []
+    if silences:
+        adjusted: list[LanguageSpan] = []
+        for index, span in enumerate(spans):
+            start = span.start
+            if index > 0:
+                lower = adjusted[-1].start + LANG_SPAN_MIN_SEC
+                upper = span.end - LANG_SPAN_MIN_SEC
+                if upper > lower:
+                    start = snap_to_silence(
+                        span.start, silences, LANG_SPAN_SNAP_WINDOW, lower=lower, upper=upper
+                    )
+            adjusted.append(LanguageSpan(round(start, 3), round(span.end, 3), span.language, span.confidence))
+        spans = adjusted
+
+    logger.info(
+        "切片 %d 语言细分：%s",
+        chunk.index,
+        "，".join(
+            f"{span.start:.0f}~{span.end:.0f}s={span.language or 'auto'}"
+            for span in spans
+        ),
+    )
+    return spans
+
+
+def _cut_subchunk(chunk: AudioChunk, span: LanguageSpan, index: int) -> Path | None:
+    """把子片写成独立 wav；失败返回 None（调用方回退整片转录）。"""
+    if sf is None:
+        return None
+    waveform = _read_waveform_span(chunk.path, span.start, span.duration)
+    if waveform is None:
+        return None
+    out = chunk.path.with_name(f"{chunk.path.stem}.sub{index:02d}.wav")
+    try:
+        sf.write(str(out), waveform, SAMPLE_RATE, subtype="PCM_16")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("子片写出失败（%s）: %s", out.name, exc)
+        out.unlink(missing_ok=True)
+        return None
+    return out
+
+
+# ---------------------------------------------------------------------------
 # 转录
 # ---------------------------------------------------------------------------
 def _transcribe_chunk(
@@ -805,17 +1221,26 @@ def _norm_text(text: str) -> str:
     return "".join(ch for ch in text.lower() if ch.isalnum())
 
 
+def _max_ngram_repeat(text: str, n: int) -> int:
+    """归一化文本里最频繁的 n-gram 出现次数（用于识别段内复读）。"""
+    if n <= 0 or len(text) < n:
+        return 0
+    counts: Counter[str] = Counter(text[i : i + n] for i in range(len(text) - n + 1))
+    return max(counts.values(), default=0)
+
+
 def _filter_hallucinations(segments: list[dict], label: str = "") -> list[dict]:
     """过滤 Whisper 在 BGM / 静音处的典型幻觉。
 
-    三类规则（阈值均可用环境变量覆盖）：
+    四类规则（阈值均可用环境变量覆盖）：
         1. compression_ratio 过高 —— 重复输出；
         2. no_speech_prob 高且 avg_logprob 低 —— 这段其实没人说话；
-        3. 与上一段归一化后完全相同 —— 连续重复字幕。
+        3. 与上一段归一化后完全相同 —— 连续重复字幕；
+        4. 段内 n-gram 复读 —— 不依赖库字段，专治「Xについては」式循环。
     少于 6 个有效字符的重复（例如「はい」「OK」）不算幻觉，避免误杀。
     """
     kept: list[dict] = []
-    dropped = {"compression": 0, "no_speech": 0, "duplicate": 0}
+    dropped = {"compression": 0, "no_speech": 0, "duplicate": 0, "repeat": 0}
     previous = ""
 
     for seg in segments:
@@ -838,6 +1263,12 @@ def _filter_hallucinations(segments: list[dict], label: str = "") -> list[dict]:
             continue
 
         normalized = _norm_text(text)
+        if (
+            len(normalized) >= HALLU_REPEAT_MIN_CHARS
+            and _max_ngram_repeat(normalized, HALLU_REPEAT_NGRAM) >= HALLU_REPEAT_COUNT
+        ):
+            dropped["repeat"] += 1
+            continue
         if len(normalized) >= 6 and normalized == previous:
             dropped["duplicate"] += 1
             continue
@@ -906,6 +1337,49 @@ def _speaker_for_span(start: float, end: float, turns: Sequence[DiarTurn]) -> st
     return max(scores.items(), key=lambda kv: kv[1])[0]
 
 
+def _speakers_for_span(
+    start: float,
+    end: float,
+    turns: Sequence[DiarTurn],
+    min_ratio: float = OVERLAP_MIN_RATIO,
+) -> list[str]:
+    """返回覆盖该时间段的全部说话人（按覆盖时长降序）。
+
+    pyannote 的 Annotation 在重叠语音处会给出同一时间段的多条 turns。
+    以前只取「重叠最多」的那一位，重叠信息直接丢了；这里保留所有覆盖比例
+    达标的人，用于给 segment 打 speakers=[...] / overlap=true。
+    """
+    total = max(0.0, end - start)
+    scores: dict[str, float] = {}
+    for turn in turns:
+        ov = _overlap(start, end, turn.start, turn.end)
+        if ov > 0:
+            scores[turn.speaker] = scores.get(turn.speaker, 0.0) + ov
+    if not scores:
+        nearest = _nearest_speaker(start, end, turns)
+        return [nearest] if nearest else []
+    ranked = sorted(scores.items(), key=lambda kv: -kv[1])
+    if total <= 0:
+        return [ranked[0][0]]
+    kept = [speaker for speaker, ov in ranked if ov / total >= min_ratio]
+    return kept or [ranked[0][0]]
+
+
+def _apply_speaker_fields(item: dict, turns: Sequence[DiarTurn]) -> dict:
+    """给一个 segment 写入 speaker（主说话人）与可选的 speakers/overlap。"""
+    start = float(item.get("start", 0.0))
+    end = float(item.get("end", start))
+    if not OVERLAP_ENABLED:
+        item["speaker"] = _speaker_for_span(start, end, turns) or "UNKNOWN"
+        return item
+    speakers = _speakers_for_span(start, end, turns)
+    item["speaker"] = speakers[0] if speakers else (_speaker_for_span(start, end, turns) or "UNKNOWN")
+    if len(speakers) > 1:
+        item["speakers"] = speakers
+        item["overlap"] = True
+    return item
+
+
 def _fill_missing_labels(labels: list[str | None]) -> list[str | None]:
     """用前后邻近的标签补齐「离所有说话人时间片都太远」的词，避免段内出现 UNKNOWN 碎片。"""
     filled = list(labels)
@@ -963,12 +1437,15 @@ def _split_segment_by_words(seg: dict, turns: Sequence[DiarTurn]) -> list[dict] 
         if not text:
             continue
         result.append(
-            {
-                "start": round(group["start"], 3),
-                "end": round(group["end"], 3),
-                "text": text,
-                "speaker": group["speaker"],
-            }
+            _apply_speaker_fields(
+                {
+                    "start": round(group["start"], 3),
+                    "end": round(group["end"], 3),
+                    "text": text,
+                    "speaker": group["speaker"],
+                },
+                turns,
+            )
         )
     return result or None
 
@@ -990,12 +1467,15 @@ def assign_speakers(segments: list[dict], turns: Sequence[DiarTurn]) -> list[dic
             assigned.extend(parts)
             continue
         assigned.append(
-            {
-                "start": round(start, 3),
-                "end": round(end, 3),
-                "text": str(seg.get("text", "")).strip(),
-                "speaker": _speaker_for_span(start, end, turns) or "UNKNOWN",
-            }
+            _apply_speaker_fields(
+                {
+                    "start": round(start, 3),
+                    "end": round(end, 3),
+                    "text": str(seg.get("text", "")).strip(),
+                    "speaker": _speaker_for_span(start, end, turns) or "UNKNOWN",
+                },
+                turns,
+            )
         )
     return assigned
 
@@ -1042,16 +1522,32 @@ def _join_text(left: str, right: str) -> str:
     return left + right if (_is_cjk(left[-1]) or _is_cjk(right[0])) else f"{left} {right}"
 
 
+def _is_single_latin(ch: str) -> bool:
+    """单个 ASCII 拉丁字母：语言错误时对齐模型会把英文切成逐字符 token。"""
+    return len(ch) == 1 and ch.isascii() and ch.isalpha()
+
+
 def _join_words(words: Sequence[dict]) -> str:
-    """把 whisperx 的 word 列表拼成文本：首尾空格由这里统一处理，CJK 不加空格。"""
+    """把 whisperx 的 word 列表拼成文本：首尾空格由这里统一处理，CJK 不加空格。
+
+    额外处理「字符级拉丁 token」：用错语言的对齐模型（例如日语 wav2vec2 对齐
+    英语）会把 Hello 切成 H/e/l/l/o，逐 token 补空格会得到 "H e l l o"。
+    相邻两个 token 都是单字母时直接拼接。
+    """
     out = ""
     for item in words:
         token = str(item.get("word", ""))
         if not token:
             continue
+        first = token.lstrip()[0] if token.lstrip() else " "
         if not out:
             out = token.lstrip()
-        elif token[0].isspace() or _is_cjk(out[-1]) or _is_cjk(token.lstrip()[0] if token.lstrip() else " "):
+        elif (
+            token[0].isspace()
+            or _is_cjk(out[-1])
+            or _is_cjk(first)
+            or (_is_single_latin(out[-1]) and _is_single_latin(first))
+        ):
             out += token
         else:
             out += f" {token}"
@@ -1087,6 +1583,9 @@ def postprocess_segments(
             "end": round(float(s.get("end", 0.0)), 3),
             "speaker": str(s.get("speaker") or "UNKNOWN"),
             "text": str(s.get("text", "")).strip(),
+            # 重叠语音：保留多说话人与标记，合并时不能被抹掉
+            "speakers": list(s.get("speakers") or []),
+            "overlap": bool(s.get("overlap")),
         }
         for s in segments
     ]
@@ -1102,26 +1601,44 @@ def postprocess_segments(
         gap = seg["start"] - prev["end"]
         same_speaker = seg["speaker"] == prev["speaker"]
         can_grow = (seg["end"] - prev["start"]) <= max_merged_sec
-        if same_speaker and gap <= gap_sec and can_grow:
+        # 重叠段单独保留：把「两个人同时说」和「一个人接着说」揉成一段会丢信息
+        if same_speaker and gap <= gap_sec and can_grow and not seg["overlap"] and not prev["overlap"]:
             prev["text"] = _join_text(prev["text"], seg["text"])
             prev["end"] = max(prev["end"], seg["end"])
             continue
         merged.append(seg)
+
+    # 清掉空字段，避免 transcript.json 里出现一堆 "speakers": []
+    for seg in merged:
+        if not seg["speakers"]:
+            seg.pop("speakers", None)
+            seg.pop("overlap", None)
 
     logger.debug("后处理：%d 段 -> %d 段", len(cleaned), len(merged))
     return merged
 
 
 def renumber_speakers(segments: list[dict]) -> dict[str, str]:
-    """把 SPEAKER_00 之类的原始标签按首次出现顺序重编号为 Speaker 1..N，便于阅读。"""
+    """把 SPEAKER_00 之类的原始标签按首次出现顺序重编号为 Speaker 1..N，便于阅读。
+
+    先按「主说话人首次出现」建映射（保持与旧版本一致的编号），再映射
+    overlap 段的 speakers 列表；只在 speakers 里出现的人追加编号。
+    """
     mapping: dict[str, str] = {}
-    for seg in segments:
-        raw = seg["speaker"]
+
+    def mapped(raw: str) -> str:
         if raw in {"UNKNOWN", ""}:
-            continue
+            return raw
         if raw not in mapping:
             mapping[raw] = f"Speaker {len(mapping) + 1}"
-        seg["speaker"] = mapping[raw]
+        return mapping[raw]
+
+    for seg in segments:
+        mapped(str(seg.get("speaker") or "UNKNOWN"))
+    for seg in segments:
+        seg["speaker"] = mapped(str(seg.get("speaker") or "UNKNOWN"))
+        if seg.get("speakers"):
+            seg["speakers"] = [mapped(str(name)) for name in seg["speakers"]]
     return mapping
 
 
@@ -1146,7 +1663,8 @@ def transcribe_task(
     :param progress:    进度回调 (stage, fraction 0~1, detail)，用于 /status 实时反馈
     :param min_speakers: 已知人数时传入，显著提升分离准确率（覆盖 DIAR_MIN/MAX_SPEAKERS）
     :param max_speakers: 同上
-    :return: {"language", "segments": [{start,end,speaker,text}], "speakers", ...}
+    :return: {"language", "language_spans", "segments": [{start,end,speaker,speakers,text}],
+              "speakers", "overlap_segments", ...}
     """
     if not chunks:
         raise TranscriptionError("切片列表为空，无法转录")
@@ -1236,66 +1754,128 @@ def transcribe_task(
         model = load_asr_model()
         _reset_peak_vram()  # 后续峰值只统计转录阶段（含对齐模型）
         total_chunks = len(chunks)
+        language_spans_payload: list[dict] = []
+        vote_reported = False
         for chunk in chunks:
             report("transcribing", chunk.index / total_chunks, f"转录切片 {chunk.index + 1}/{total_chunks}")
             logger.info("转录切片 %d/%d（start=%.1fs, %.1fs）", chunk.index + 1, len(chunks), chunk.start_sec, chunk.duration_sec)
             t0 = time.time()
-            result = _transcribe_chunk(model, chunk.path, BATCH_SIZE, fixed_lang)
 
-            chunk_language = result.get("language") or fixed_lang or "unknown"
-            detected_languages.append(chunk_language)
-            segments = _filter_hallucinations(
-                [dict(s) for s in (result.get("segments") or [])],
-                label=f"切片 {chunk.index}",
-            )
+            # 解码前先按语言变化切子片：一片里 20 分钟日语 + 10 分钟英语时，
+            # 整片用一个 language 解码会把后半段写成假名/字符级拉丁字母。
+            spans = plan_language_spans(model, chunk, fixed_lang)
+            sub_paths: list[Path | None] = [None] * len(spans)
+            if len(spans) > 1:
+                sub_paths = [_cut_subchunk(chunk, span, index) for index, span in enumerate(spans)]
+                if any(path is None for path in sub_paths):
+                    logger.warning("切片 %d 子片切分失败，回退为整片转录", chunk.index)
+                    for path in sub_paths:
+                        if path is not None:
+                            Path(path).unlink(missing_ok=True)
+                    spans = [LanguageSpan(0.0, round(chunk.duration_sec, 3), fixed_lang, 0.0)]
+                    sub_paths = [None]
 
-            # 只有「明显单语」时才锁定全局语言；多语内容/平票继续逐片检测。
-            # 强行锁成单一语言会把英文/韩文段按错误语言解码，错误会被放大到整片。
-            if fixed_lang is None and segments:
-                lang_votes[chunk_language] += 1
-                total_votes = sum(lang_votes.values())
-                top, count = lang_votes.most_common(1)[0]
-                if total_votes >= LANG_VOTE_SAMPLES:
-                    if count / total_votes >= LANG_VOTE_MIN_SHARE:
-                        fixed_lang = top
-                        logger.info("语言投票锁定：%s（票数 %s）", fixed_lang, dict(lang_votes))
-                    else:
-                        logger.info(
-                            "多语内容（票数 %s），不锁定语言，继续逐片检测", dict(lang_votes)
+            for span_index, span in enumerate(spans):
+                span_start = round(chunk.start_sec + span.start, 3)
+                span_end = round(chunk.start_sec + span.end, 3)
+                # 只有置信度达标的语言才强制传给 whisper；否则让它在子片上自己检测
+                span_language = span.language if span.confidence >= LANG_SPAN_MIN_CONF else None
+                span_language = span_language or fixed_lang
+                if len(spans) > 1:
+                    report(
+                        "transcribing",
+                        (chunk.index + span_index / len(spans)) / total_chunks,
+                        f"转录切片 {chunk.index + 1}/{total_chunks} · 子片 "
+                        f"{span_index + 1}/{len(spans)}（{span_language or 'auto'}）",
+                    )
+
+                transcribe_path = sub_paths[span_index] or chunk.path
+                offset = span_start if sub_paths[span_index] is not None else chunk.start_sec
+                try:
+                    result = _transcribe_chunk(model, transcribe_path, BATCH_SIZE, span_language)
+
+                    chunk_language = result.get("language") or span_language or "unknown"
+                    detected_languages.append(chunk_language)
+                    segments = _filter_hallucinations(
+                        [dict(s) for s in (result.get("segments") or [])],
+                        label=f"切片 {chunk.index}" + (f"-{span_index}" if len(spans) > 1 else ""),
+                    )
+
+                    # 投票默认只做统计：锁定语言会让后续切片强制单语，与多语种采访冲突。
+                    if lang is None and segments:
+                        lang_votes[chunk_language] += 1
+                        total_votes = sum(lang_votes.values())
+                        top, count = lang_votes.most_common(1)[0]
+                        if total_votes >= LANG_VOTE_SAMPLES and not vote_reported:
+                            if count / total_votes >= LANG_VOTE_MIN_SHARE:
+                                if LANG_VOTE_LOCK:
+                                    fixed_lang = top
+                                    logger.info("语言投票锁定：%s（票数 %s）", fixed_lang, dict(lang_votes))
+                                else:
+                                    logger.info(
+                                        "主导语言 %s（票数 %s）；仅用于统计，不锁定后续切片",
+                                        top, dict(lang_votes),
+                                    )
+                            else:
+                                logger.info(
+                                    "多语内容（票数 %s），后续子片各自检测语言", dict(lang_votes)
+                                )
+                            vote_reported = True
+
+                    # 对齐结果只用于「按说话人拆段」：没有说话人标签时 words 根本不会被读取，
+                    # 却要按语言各下载/加载一次 1.2GB wav2vec2，因此一律跳过。
+                    align_language = span_language or chunk_language
+                    if ALIGN_ENABLED and segments and turns and align_language != "unknown":
+                        segments = _align_segments(segments, transcribe_path, align_language)
+
+                    _offset_segments(segments, offset)
+
+                    local_turns = [
+                        t for t in turns
+                        if t.end >= span_start - 1.0 and t.start <= span_end + 1.0
+                    ]
+                    segments = assign_speakers(segments, local_turns)
+                    for seg in segments:
+                        seg["chunk_index"] = chunk.index
+                        if len(spans) > 1:
+                            seg["span_index"] = span_index
+                    collected.extend(segments)
+                    chunk_stats.append(
+                        {
+                            "index": chunk.index,
+                            "span": span_index if len(spans) > 1 else None,
+                            "start": round(span_start, 1),
+                            "duration": round(span.end - span.start, 1),
+                            "language": chunk_language,
+                            "segments": len(segments),
+                        }
+                    )
+                    language_spans_payload.append(
+                        {
+                            "start": span_start,
+                            "end": span_end,
+                            "language": chunk_language,
+                            "confidence": round(span.confidence, 3),
+                            "segments": len(segments),
+                        }
+                    )
+                    logger.info(
+                        "切片 %d%s 完成：%d 段，语言=%s，耗时 %.1fs",
+                        chunk.index,
+                        f" 子片 {span_index + 1}/{len(spans)}（{span.start:.0f}~{span.end:.0f}s）"
+                        if len(spans) > 1 else "",
+                        len(segments), chunk_language, time.time() - t0,
+                    )
+                    if not segments:
+                        logger.warning(
+                            "切片 %d（%.0f~%.0fs）没有转录出任何文本：疑似纯音乐/静音，或切片内容异常",
+                            chunk.index, span_start, span_end,
                         )
-
-            # 对齐结果只用于「按说话人拆段」：没有说话人标签时 words 根本不会被读取，
-            # 却要按语言各下载/加载一次 1.2GB wav2vec2，因此一律跳过。
-            align_language = fixed_lang or chunk_language
-            if ALIGN_ENABLED and segments and turns and align_language != "unknown":
-                segments = _align_segments(segments, chunk.path, align_language)
-
-            _offset_segments(segments, chunk.start_sec)
-
-            local_turns = [
-                t for t in turns
-                if t.end >= chunk.start_sec - 1.0 and t.start <= chunk.end_sec + 1.0
-            ]
-            segments = assign_speakers(segments, local_turns)
-            for seg in segments:
-                seg["chunk_index"] = chunk.index
-            collected.extend(segments)
-            chunk_stats.append(
-                {
-                    "index": chunk.index,
-                    "start": round(chunk.start_sec, 1),
-                    "duration": round(chunk.duration_sec, 1),
-                    "language": chunk_language,
-                    "segments": len(segments),
-                }
-            )
-            logger.info("切片 %d 完成：%d 段，耗时 %.1fs", chunk.index, len(segments), time.time() - t0)
-            if not segments:
-                logger.warning(
-                    "切片 %d（%.0f~%.0fs）没有转录出任何文本：疑似纯音乐/静音，或切片内容异常",
-                    chunk.index, chunk.start_sec, chunk.end_sec,
-                )
-            free_cuda_memory()
+                    free_cuda_memory()
+                finally:
+                    # 对齐阶段也要读这个文件，必须等整段处理完再删
+                    if sub_paths[span_index] is not None:
+                        Path(sub_paths[span_index]).unlink(missing_ok=True)
 
         if not collected:
             raise TranscriptionError("所有切片都没有转录出文本，请检查音频是否含有效语音")
@@ -1304,7 +1884,7 @@ def transcribe_task(
         if empty_chunks and total_duration:
             covered = sum(c["duration"] for c in empty_chunks)
             logger.warning(
-                "%d/%d 个切片没有文本，共 %.0fs（%.1f%%）：%s",
+                "%d/%d 个片段没有文本，共 %.0fs（%.1f%%）：%s",
                 len(empty_chunks), len(chunk_stats), covered, covered / total_duration * 100,
                 [
                     f"{c['start']:.0f}-{c['start'] + c['duration']:.0f}s"
@@ -1351,14 +1931,19 @@ def transcribe_task(
                     delta,
                 )
 
+        overlap_segments = sum(1 for seg in segments if seg.get("overlap"))
         result_payload = {
             "language": language_out,
             "chunk_languages": detected_languages,
             "chunks": chunk_stats,
+            # 片内语言细分的最终结果（全局时间戳），排查「哪一段被判成什么语言」
+            "language_spans": language_spans_payload,
             "segments": segments,
             "speakers": [mapping[k] for k in sorted(mapping, key=lambda k: int(mapping[k].split()[-1]))],
             "speaker_stats": _speaker_stats(turns, mapping),
             "num_segments": len(segments),
+            # 多人同时说话：这些段带 speakers 列表与 overlap=true，文本本身无法拆开
+            "overlap_segments": overlap_segments,
             "duration_sec": total_duration,
             "diarized": bool(turns),
             # 分离为什么没成功：写进产物，UI/总结不必再翻日志
@@ -1373,8 +1958,8 @@ def transcribe_task(
             "elapsed_sec": round(time.time() - started, 1),
         }
         logger.info(
-            "转录完成：%d 段 / %d 位说话人 / 语音占比 %.1f%% / 转录峰值显存 %.0f MB / 总耗时 %.1fs",
-            result_payload["num_segments"], len(result_payload["speakers"]),
+            "转录完成：%d 段 / %d 位说话人 / 重叠 %d 段 / 语音占比 %.1f%% / 转录峰值显存 %.0f MB / 总耗时 %.1fs",
+            result_payload["num_segments"], len(result_payload["speakers"]), overlap_segments,
             speech_ratio * 100, result_payload["peak_vram_mb"], result_payload["elapsed_sec"],
         )
         return result_payload

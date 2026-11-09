@@ -58,7 +58,7 @@ SYSTEM_PROMPT = """你是一位资深的多语言内容分析师，擅长把口�
 硬性规则（必须全部遵守）：
 1. 全部使用简体中文输出。人名、公司名、产品名、技术术语保留原文（英文/韩文/日文），首次出现时用括号给出中文解释，例如：Retrieval-Augmented Generation（检索增强生成）。
 2. 时间戳必须保留，格式为 HH:MM:SS，只在「章节脉络」和「关键观点」中使用，且只能使用转录中真实出现过的时间点，严禁编造或估算。
-3. 必须区分说话人。归纳观点时标明是谁说的（如「Speaker 2 认为…」）；不要把你自己的推断安到某个说话人头上。
+3. 必须区分说话人。归纳观点时标明是谁说的（如「Speaker 2 认为…」）；不要把你自己的推断安到某个说话人头上。若某行标注为「Speaker 1 + Speaker 2（同时说话）」，表示这段是多人重叠发言：如实描述为多人同时发言，不要归给其中一个人，也不要猜测谁说了哪半句。
 4. 严格区分三类信息：转录中明确陈述的事实、说话人的主观观点、以及尚待确认的疑问。事实要写清楚数据与条件（数字、时间、版本、比例等）。
 5. 若转录中出现韩语、日语或混合语言片段，先给出中文意译，再在括号内保留关键词原文。
 6. 禁止编造转录中不存在的内容；信息不足时写「转录中未提及」，不要用常识补全。
@@ -410,7 +410,12 @@ def format_timestamp(seconds: float) -> str:
 
 
 def format_segment(seg: dict) -> str:
-    return f"[{format_timestamp(seg.get('start', 0))}] {seg.get('speaker') or 'Speaker ?'}: {str(seg.get('text', '')).strip()}"
+    speaker = str(seg.get("speaker") or "Speaker ?")
+    # 重叠语音：把「同时说话」的其他人一并写进行首，总结时才不会被误记到一个人头上
+    others = [str(name) for name in (seg.get("speakers") or []) if name and str(name) != speaker]
+    if others:
+        speaker = f"{speaker} + {' + '.join(others)}（同时说话）"
+    return f"[{format_timestamp(seg.get('start', 0))}] {speaker}: {str(seg.get('text', '')).strip()}"
 
 
 def format_transcript(segments: Sequence[dict]) -> str:
@@ -421,9 +426,11 @@ def format_transcript(segments: Sequence[dict]) -> str:
 def _collect_speakers(segments: Sequence[dict]) -> list[str]:
     seen: list[str] = []
     for seg in segments:
-        name = str(seg.get("speaker") or "UNKNOWN")
-        if name not in seen:
-            seen.append(name)
+        names = [seg.get("speaker"), *(seg.get("speakers") or [])]
+        for raw in names:
+            name = str(raw or "UNKNOWN")
+            if name not in seen:
+                seen.append(name)
     return seen
 
 
@@ -755,14 +762,21 @@ def normalize_payload(payload: Any) -> dict:
             continue
         if end < start:
             end = start
-        cleaned.append(
-            {
-                "start": round(start, 3),
-                "end": round(end, 3),
-                "speaker": str(item.get("speaker") or "UNKNOWN"),
-                "text": text,
-            }
-        )
+        entry = {
+            "start": round(start, 3),
+            "end": round(end, 3),
+            "speaker": str(item.get("speaker") or "UNKNOWN"),
+            "text": text,
+        }
+        # 重叠语音：多说话人段落的 speakers=[...] 必须保留到这里，
+        # 否则后面 format_segment 拿不到「A + B 同时说话」的信息。
+        raw_speakers = item.get("speakers")
+        if isinstance(raw_speakers, list):
+            names = [str(name) for name in raw_speakers if str(name or "").strip()]
+            if len(names) > 1:
+                entry["speakers"] = names
+                entry["overlap"] = bool(item.get("overlap", True))
+        cleaned.append(entry)
 
     if not cleaned:
         raise SummarizationError("segments 里没有任何可用的文本（text 全为空或时间戳非法）")
@@ -781,15 +795,20 @@ def normalize_payload(payload: Any) -> dict:
 def _extract_segments(payload: Any) -> tuple[list[dict], dict]:
     """规范化输入并拆出 (segments, meta)。"""
     payload = normalize_payload(payload)
-    segments = [
-        {
+    segments = []
+    for seg in payload["segments"]:
+        item = {
             "start": float(seg["start"]),
             "end": float(seg["end"]),
             "speaker": seg["speaker"],
             "text": seg["text"],
         }
-        for seg in payload["segments"]
-    ]
+        # 重叠语音：保留多说话人信息，format_segment 会写成「A + B（同时说话）」
+        if seg.get("speakers"):
+            item["speakers"] = list(seg["speakers"])
+        if seg.get("overlap"):
+            item["overlap"] = True
+        segments.append(item)
     speakers = payload.get("speakers") or []
     # 只有「确实分离出了具名说话人」才按多人对话总结；
     # 否则模型会被要求区分根本不存在的 Speaker，只能编造。
