@@ -798,7 +798,7 @@ python -m app.services.summarizer ./demo.json --out ./summary.md
 | `ASR_LANG_SNAP_WINDOW` / `ASR_LANG_MIN_CHUNK_SEC` | `6` / `45` | 子片边界吸附静音的半径；切片短于该值不做细分 |
 | `ASR_LANG_MAX_PARTS` | `6` | 单切片最多切出多少语言子片；超过说明是 BGM/噪声导致检测抖动，退回整片 |
 | `ASR_OVERLAP` | `1` | 重叠语音标注开关。开启后重叠段带 `speakers=[...]` 与 `overlap=true` |
-| `ASR_OVERLAP_MIN_RATIO` | `0.15` | 某说话人覆盖 segment 时长达该比例才算「同时说话」 |
+| `ASR_OVERLAP_MIN_RATIO` | `0.3` | 某说话人覆盖 segment 时长达该比例才算「同时说话」；0.15 会把换人瞬间也标成重叠 |
 | `DIARIZATION_MODEL` | `pyannote/speaker-diarization-3.1` | 需 Agree 的模型见 [模型授权](#模型授权必读) |
 | `DIAR_AUDIO_INPUT` | `waveform` | `waveform`=自己解码 16k wav 传入（不依赖 torchcodec，推荐）；`path`=把路径交给 pyannote（需 torchcodec 与 torch 版本匹配 + 共享版 FFmpeg） |
 | `ENABLE_DIARIZATION` | `true` | 关掉则只转录、不打说话人标签（可省 HF_TOKEN） |
@@ -814,6 +814,7 @@ python -m app.services.summarizer ./demo.json --out ./summary.md
 | `MERGE_GAP_SEC` / `MAX_MERGED_SEC` | `0.8` / `60` | 同说话人合并阈值与单段上限 |
 | `MERGE_GAP_SEC_NO_DIAR` | `0.3` | 无说话人标签时的合并窗口 |
 | `HALLU_NO_SPEECH_PROB` / `HALLU_AVG_LOGPROB` / `HALLU_COMPRESSION_RATIO` | `0.6` / `-1.0` / `2.4` | Whisper 幻觉过滤阈值（BGM/静音处的重复与「感谢观看」类输出） |
+| `HALLU_REPEAT_NGRAM` / `HALLU_REPEAT_COUNT` / `HALLU_REPEAT_MIN_CHARS` | `6` / `5` / `80` | 段内复读检测。命中时截断保留前半段；剩余不足 30% 才整段丢弃 |
 
 ### 总结
 

@@ -200,8 +200,10 @@ LANG_SPAN_MAX_PARTS = max(2, int(os.getenv("ASR_LANG_MAX_PARTS", "6")))
 OVERLAP_ENABLED = (os.getenv("ASR_OVERLAP", "1") or "1").strip().lower() not in {
     "0", "false", "no", "off",
 }
-# 某说话人覆盖 segment 时长达到该比例才算「同时说话」，避免把换人瞬间标成重叠
-OVERLAP_MIN_RATIO = min(0.9, max(0.05, float(os.getenv("ASR_OVERLAP_MIN_RATIO", "0.15"))))
+# 某说话人覆盖 segment 时长达到该比例才算「同时说话」。
+# 0.15 太松：pyannote 的换人瞬间会同时命中两个人，正常对话能标出 30%+ 重叠段；
+# 0.3 更接近真实重叠语音（双方都持续说话）。
+OVERLAP_MIN_RATIO = min(0.9, max(0.05, float(os.getenv("ASR_OVERLAP_MIN_RATIO", "0.3"))))
 
 ASR_OPTIONS: dict[str, Any] = {
     # 长音频 + 无重叠切片场景下，关闭上文条件可显著减少重复输出
@@ -915,27 +917,51 @@ def merge_language_windows(
 
 
 def _read_waveform_span(path: Path, start_sec: float, duration_sec: float) -> Any:
-    """读取 PCM wav 的一段为 float32 单声道波形（供 detect_language 使用）。"""
-    if sf is None:
-        return None
+    """读取 PCM wav 的一段为 float32 单声道波形（供 detect_language 使用）。
+
+    优先 soundfile；缺失时退回标准库 wave（项目生成的 wav 固定是 16k /
+    mono / PCM16）。不能依赖 soundfile：说话人分离有 stdlib 兜底，
+    这里若直接返回 None，语言细分会静默退化成「整片一种语言」。
+    """
+    frames = max(1, int(round(duration_sec * SAMPLE_RATE)))
+    start_frame = max(0, int(round(start_sec * SAMPLE_RATE)))
+
+    if sf is not None:
+        try:
+            data, rate = sf.read(
+                str(path),
+                start=start_frame,
+                frames=frames,
+                dtype="float32",
+                always_2d=False,
+            )
+            if rate == SAMPLE_RATE and data is not None and len(data) > 0:
+                if getattr(data, "ndim", 1) > 1:
+                    data = data.mean(axis=1)
+                return data
+        except Exception as exc:  # noqa: BLE001 - 继续尝试 stdlib 兜底
+            logger.debug("soundfile 读取片段失败（%s @ %.1fs）: %s", path.name, start_sec, exc)
+
     try:
-        frames = max(1, int(round(duration_sec * SAMPLE_RATE)))
-        start_frame = max(0, int(round(start_sec * SAMPLE_RATE)))
-        data, rate = sf.read(
-            str(path),
-            start=start_frame,
-            frames=frames,
-            dtype="float32",
-            always_2d=False,
-        )
-    except Exception as exc:  # noqa: BLE001 - 读失败不应该中断转录
+        import wave  # noqa: PLC0415
+
+        import numpy as np  # noqa: PLC0415
+
+        with wave.open(str(path), "rb") as handle:
+            if (
+                handle.getframerate() != SAMPLE_RATE
+                or handle.getnchannels() != 1
+                or handle.getsampwidth() != 2
+            ):
+                return None
+            handle.setpos(start_frame)
+            raw = handle.readframes(frames)
+        if not raw:
+            return None
+        return np.frombuffer(raw, dtype="<i2").astype("float32") / 32768.0
+    except Exception as exc:  # noqa: BLE001
         logger.debug("读取音频片段失败（%s @ %.1fs）: %s", path.name, start_sec, exc)
         return None
-    if rate != SAMPLE_RATE or data is None or len(data) == 0:
-        return None
-    if getattr(data, "ndim", 1) > 1:
-        data = data.mean(axis=1)
-    return data
 
 
 def _is_silent_waveform(waveform: Any, threshold: float = 1e-3) -> bool:
@@ -990,31 +1016,79 @@ def _language_probe_failed(exc: Exception) -> tuple[str | None, float]:
     return None, 0.0
 
 
+def _normalize_language_code(raw: Any) -> str | None:
+    """whisper 的语言代码是 2~3 位字母（en / ja / kor…）。
+
+    解析失败时不要返回 "0.93" 这种数字串：它会伪装成合法语言污染后续统计。
+    """
+    if raw is None:
+        return None
+    text = str(raw).strip().lower()
+    if 2 <= len(text) <= 3 and text.isalpha():
+        return text
+    return None
+
+
+def _as_probability(raw: Any) -> float:
+    """把各版本返回的置信度统一到 0~1。
+
+    - 概率：0~1
+    - 少数封装返回 0~100
+    - 个别版本返回 log-prob（负数），用 exp 还原
+    """
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return 0.0
+    if value < 0:
+        try:
+            value = math.exp(value)
+        except OverflowError:
+            return 0.0
+    if value > 1.0:
+        value = value / 100.0 if value <= 100.0 else 1.0
+    return max(0.0, min(1.0, value))
+
+
 def _parse_language_result(result: Any) -> tuple[str | None, float]:
-    """兼容 faster-whisper 各版本：tuple(lang, prob, all_probs) 或 dataclass。"""
-    language: str | None = None
-    probability = 0.0
-    if isinstance(result, (tuple, list)):
-        if result and result[0]:
-            language = str(result[0]).lower()
-        if len(result) > 1 and result[1] is not None:
-            try:
-                probability = float(result[1])
-            except (TypeError, ValueError):
-                probability = 0.0
+    """兼容 faster-whisper / murmurai 各版本的 detect_language 返回值。
+
+    已知形态：
+        1. (language, probability, all_probs)          —— faster-whisper 1.x
+        2. LanguageDetection(language, language_probability) —— 新版本 dataclass
+        3. dict / 反序 tuple (probability, language)   —— 第三方封装
+        4. 字段名叫 probability / prob / confidence    —— 版本漂移
+    解析不出来就返回 (None, 0.0)，由上层当作「未知」处理，不再静默当成整片单语。
+    """
+    if result is None:
+        return None, 0.0
+
+    raw_language: Any = None
+    raw_probability: Any = None
+
+    if isinstance(result, dict):
+        raw_language = result.get("language")
+        raw_probability = result.get("language_probability")
+        if raw_probability is None:
+            raw_probability = result.get("probability")
+    elif isinstance(result, (tuple, list)):
+        if not result:
+            return None, 0.0
+        first = result[0]
+        second = result[1] if len(result) > 1 else None
+        # 兼容 (probability, language) 反序
+        if isinstance(first, (int, float)) and isinstance(second, str):
+            first, second = second, first
+        raw_language, raw_probability = first, second
     else:
         raw_language = getattr(result, "language", None)
-        if raw_language:
-            language = str(raw_language).lower()
-        try:
-            probability = float(getattr(result, "language_probability", 0.0) or 0.0)
-        except (TypeError, ValueError):
-            probability = 0.0
-    if probability < 0:
-        probability = 0.0
-    if probability > 1:
-        probability = 1.0
-    return language, probability
+        for attr in ("language_probability", "probability", "prob", "confidence", "score"):
+            value = getattr(result, attr, None)
+            if value is not None:
+                raw_probability = value
+                break
+
+    return _normalize_language_code(raw_language), _as_probability(raw_probability)
 
 
 def plan_language_spans(
@@ -1026,17 +1100,23 @@ def plan_language_spans(
 
     退化为「整片一种语言」的情况：
         - 用户显式指定了 ASR_LANGUAGE（fixed_lang 非空）；
-        - 关闭了 ASR_LANG_SPAN，或 soundfile 不可用；
+        - 关闭了 ASR_LANG_SPAN；
         - 切片太短（< LANG_SPAN_MIN_CHUNK_SEC），细分反而损失上下文；
         - 所有窗口语言一致（最常见，保持一次转录，性能不变）。
+
+    每种提前返回都会打日志：细分是否生效必须一眼可见，不能静默退化。
     """
     whole = LanguageSpan(0.0, round(chunk.duration_sec, 3), fixed_lang, 1.0 if fixed_lang else 0.0)
-    if (
-        fixed_lang
-        or not LANG_SPAN_ENABLED
-        or sf is None
-        or chunk.duration_sec < max(LANG_SPAN_MIN_CHUNK_SEC, LANG_PROBE_SEC * 1.5)
-    ):
+    if fixed_lang:
+        logger.info("切片 %d 使用指定语言 %s，跳过片内语言细分", chunk.index, fixed_lang)
+        return [whole]
+    if not LANG_SPAN_ENABLED:
+        logger.info("切片 %d 片内语言细分已关闭（ASR_LANG_SPAN=0）", chunk.index)
+        return [whole]
+    if chunk.duration_sec < max(LANG_SPAN_MIN_CHUNK_SEC, LANG_PROBE_SEC * 1.5):
+        logger.info(
+            "切片 %d 仅 %.1fs，短于语言细分阈值，整片转录", chunk.index, chunk.duration_sec
+        )
         return [whole]
 
     windows: list[LanguageWindow] = []
@@ -1066,11 +1146,30 @@ def plan_language_spans(
         )
         cursor += length
 
+    if windows:
+        logger.info(
+            "切片 %d 语言探测：%s",
+            chunk.index,
+            "，".join(
+                f"{window.start:.0f}s={window.language or '?'}({window.confidence:.2f})"
+                for window in windows
+            ),
+        )
+        if all(window.language is None for window in windows):
+            logger.warning(
+                "切片 %d 所有窗口都未得到可信语言（detect_language 返回不可解析？），整片交给 whisper 自动检测",
+                chunk.index,
+            )
+
     spans = merge_language_windows(windows)
     if len(spans) <= 1:
         detected = spans[0].language if spans else None
         confidence = spans[0].confidence if spans else 0.0
         # 片内语言一致时也用检测结果：比让 whisper 在全片上再猜一次更准
+        logger.info(
+            "切片 %d 片内语言一致（%s），整片转录",
+            chunk.index, detected or "auto",
+        )
         return [
             LanguageSpan(
                 whole.start,
@@ -1115,20 +1214,35 @@ def plan_language_spans(
 
 
 def _cut_subchunk(chunk: AudioChunk, span: LanguageSpan, index: int) -> Path | None:
-    """把子片写成独立 wav；失败返回 None（调用方回退整片转录）。"""
-    if sf is None:
-        return None
+    """把子片写成独立 16k PCM16 wav；失败返回 None（调用方回退整片转录）。"""
     waveform = _read_waveform_span(chunk.path, span.start, span.duration)
     if waveform is None:
         return None
     out = chunk.path.with_name(f"{chunk.path.stem}.sub{index:02d}.wav")
+
+    if sf is not None:
+        try:
+            sf.write(str(out), waveform, SAMPLE_RATE, subtype="PCM_16")
+            return out
+        except Exception as exc:  # noqa: BLE001 - 继续尝试 stdlib 兜底
+            logger.debug("soundfile 写子片失败（%s）: %s", out.name, exc)
+
     try:
-        sf.write(str(out), waveform, SAMPLE_RATE, subtype="PCM_16")
+        import wave  # noqa: PLC0415
+
+        import numpy as np  # noqa: PLC0415
+
+        pcm = np.clip(np.asarray(waveform) * 32767.0, -32768, 32767).astype("<i2")
+        with wave.open(str(out), "wb") as handle:
+            handle.setnchannels(1)
+            handle.setsampwidth(2)
+            handle.setframerate(SAMPLE_RATE)
+            handle.writeframes(pcm.tobytes())
+        return out
     except Exception as exc:  # noqa: BLE001
         logger.warning("子片写出失败（%s）: %s", out.name, exc)
         out.unlink(missing_ok=True)
         return None
-    return out
 
 
 # ---------------------------------------------------------------------------
@@ -1229,6 +1343,28 @@ def _max_ngram_repeat(text: str, n: int) -> int:
     return max(counts.values(), default=0)
 
 
+def _truncate_at_repeat(text: str, n: int, count: int) -> str:
+    """把段内复读截断到**第一次**出现的位置。
+
+    比「整段丢弃」安全：一段里前半是正常内容、后半开始循环时，
+    截断能保住前半段。截到第一次出现而不是第 count 次，是为了把
+    循环本身（以及它前面的几次重复）一起清掉。
+    """
+    normalized, index = _norm_index(text)
+    if len(normalized) < n:
+        return text
+    positions: dict[str, list[int]] = {}
+    for i in range(len(normalized) - n + 1):
+        positions.setdefault(normalized[i : i + n], []).append(i)
+    candidates = [pos[0] for pos in positions.values() if len(pos) >= count]
+    if not candidates:
+        return text
+    cut = min(candidates)
+    if cut >= len(index):
+        return text
+    return text[: index[cut]].strip()
+
+
 def _filter_hallucinations(segments: list[dict], label: str = "") -> list[dict]:
     """过滤 Whisper 在 BGM / 静音处的典型幻觉。
 
@@ -1237,10 +1373,11 @@ def _filter_hallucinations(segments: list[dict], label: str = "") -> list[dict]:
         2. no_speech_prob 高且 avg_logprob 低 —— 这段其实没人说话；
         3. 与上一段归一化后完全相同 —— 连续重复字幕；
         4. 段内 n-gram 复读 —— 不依赖库字段，专治「Xについては」式循环。
+           命中时先截断保留前半段，只有截断后不足 6 个有效字符才整段丢弃。
     少于 6 个有效字符的重复（例如「はい」「OK」）不算幻觉，避免误杀。
     """
     kept: list[dict] = []
-    dropped = {"compression": 0, "no_speech": 0, "duplicate": 0, "repeat": 0}
+    dropped = {"compression": 0, "no_speech": 0, "duplicate": 0, "repeat": 0, "truncated": 0}
     previous = ""
 
     for seg in segments:
@@ -1267,8 +1404,23 @@ def _filter_hallucinations(segments: list[dict], label: str = "") -> list[dict]:
             len(normalized) >= HALLU_REPEAT_MIN_CHARS
             and _max_ngram_repeat(normalized, HALLU_REPEAT_NGRAM) >= HALLU_REPEAT_COUNT
         ):
-            dropped["repeat"] += 1
-            continue
+            truncated = _truncate_at_repeat(text, HALLU_REPEAT_NGRAM, HALLU_REPEAT_COUNT)
+            kept_chars = len(_norm_text(truncated))
+            # 整段几乎都是循环（截断后只剩零头）就没有保留价值，直接丢
+            if kept_chars < 6 or kept_chars < len(normalized) * 0.3:
+                dropped["repeat"] += 1
+                continue
+            logger.info(
+                "%s段内复读截断：%d 字 -> %d 字",
+                f"[{label}] " if label else "",
+                len(text), len(truncated),
+            )
+            dropped["truncated"] += 1
+            seg = dict(seg)
+            seg["text"] = truncated
+            text = truncated
+            normalized = _norm_text(text)
+
         if len(normalized) >= 6 and normalized == previous:
             dropped["duplicate"] += 1
             continue
@@ -1279,7 +1431,7 @@ def _filter_hallucinations(segments: list[dict], label: str = "") -> list[dict]:
     total_dropped = sum(dropped.values())
     if total_dropped:
         logger.info(
-            "幻觉过滤%s：丢弃 %d 段（%s）",
+            "幻觉过滤%s：处理 %d 段（%s）",
             f"[{label}]" if label else "",
             total_dropped,
             {k: v for k, v in dropped.items() if v},

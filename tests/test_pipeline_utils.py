@@ -788,6 +788,52 @@ def test_normalize_payload_keeps_overlap_fields() -> None:
     assert payload["speakers"] == ["Speaker 1", "Speaker 2"]
 
 
+def test_parse_language_result_variants() -> None:
+    class WithProbability:
+        language = "ja"
+        probability = 0.72
+
+    class WithLanguageProbability:
+        language = "en"
+        language_probability = 0.91
+
+    assert transcribe._parse_language_result(("ja", 0.93, [])) == ("ja", 0.93)
+    assert transcribe._parse_language_result(("EN", 1.0, [])) == ("en", 1.0)
+    # 反序 tuple
+    assert transcribe._parse_language_result((0.81, "ko")) == ("ko", 0.81)
+    # dict
+    assert transcribe._parse_language_result(
+        {"language": "ja", "language_probability": 0.66}
+    ) == ("ja", 0.66)
+    # dataclass 字段名漂移
+    assert transcribe._parse_language_result(WithProbability()) == ("ja", 0.72)
+    assert transcribe._parse_language_result(WithLanguageProbability()) == ("en", 0.91)
+    # 0~100 与 log-prob
+    assert transcribe._parse_language_result(("ja", 93)) == ("ja", 0.93)
+    assert transcribe._parse_language_result(("ja", -0.1))[1] > 0.9
+    # 数字不能伪装成语言代码
+    assert transcribe._parse_language_result((0.93, None)) == (None, 0.0)
+    assert transcribe._parse_language_result(None) == (None, 0.0)
+
+
+def test_truncate_at_repeat_keeps_prefix() -> None:
+    normal = "This is a normal sentence about the update"
+    repeated = normal + "については" * 10
+    truncated = transcribe._truncate_at_repeat(repeated, 6, 5)
+    assert truncated.startswith("This is a normal sentence")
+    assert "については" not in truncated
+    assert transcribe._truncate_at_repeat(normal, 6, 5) == normal
+
+
+def test_filter_hallucinations_truncates_partial_repeat() -> None:
+    normal = "This is a normal sentence about the update and the new character"
+    repeated = normal + "については" * 10
+    kept = transcribe._filter_hallucinations([{"text": repeated}])
+    assert len(kept) == 1
+    assert kept[0]["text"].startswith("This is a normal sentence")
+    assert "については" not in kept[0]["text"]
+
+
 if __name__ == "__main__":
     failures = 0
     for name, func in sorted(globals().items()):
