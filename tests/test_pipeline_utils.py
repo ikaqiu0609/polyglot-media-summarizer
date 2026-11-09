@@ -799,6 +799,11 @@ def test_parse_language_result_variants() -> None:
 
     assert transcribe._parse_language_result(("ja", 0.93, [])) == ("ja", 0.93)
     assert transcribe._parse_language_result(("EN", 1.0, [])) == ("en", 1.0)
+    # murmurai 只返回语言字符串（实测形态）
+    assert transcribe._parse_language_result("ja") == ("ja", 1.0)
+    assert transcribe._parse_language_result("Language.JA") == ("ja", 1.0)
+    assert transcribe._parse_language_result("EN-US") == ("en", 1.0)
+    assert transcribe._parse_language_result("") == (None, 0.0)
     # 反序 tuple
     assert transcribe._parse_language_result((0.81, "ko")) == ("ko", 0.81)
     # dict

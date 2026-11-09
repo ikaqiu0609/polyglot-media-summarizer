@@ -278,6 +278,8 @@ _DIAR_LAST_ERROR: str = ""
 _LANG_DETECT_UNAVAILABLE: str = ""
 # 连续失败次数（偶发的单窗异常不足以禁用整个机制）
 _LANG_DETECT_FAILURES: int = 0
+# 只打印一次 detect_language 的原始返回形态，便于定位版本差异
+_LANG_RESULT_LOGGED: bool = False
 
 
 def _clear_align_cache() -> None:
@@ -978,7 +980,7 @@ def probe_language(model: Any, waveform: Any) -> tuple[str | None, float]:
     murmurai（whisperx fork）继承 faster-whisper 的 detect_language，
     但不同版本参数名/返回值有差异，这里做兼容解析。
     """
-    global _LANG_DETECT_UNAVAILABLE, _LANG_DETECT_FAILURES
+    global _LANG_DETECT_UNAVAILABLE, _LANG_DETECT_FAILURES, _LANG_RESULT_LOGGED
     if _LANG_DETECT_UNAVAILABLE or waveform is None:
         return None, 0.0
 
@@ -998,6 +1000,11 @@ def probe_language(model: Any, waveform: Any) -> tuple[str | None, float]:
             return _language_probe_failed(exc)
     except Exception as exc:  # noqa: BLE001
         return _language_probe_failed(exc)
+
+    global _LANG_RESULT_LOGGED
+    if not _LANG_RESULT_LOGGED:
+        _LANG_RESULT_LOGGED = True
+        logger.info("detect_language 首次返回：type=%s repr=%s", type(result).__name__, repr(result)[:300])
 
     _LANG_DETECT_FAILURES = 0
     return _parse_language_result(result)
@@ -1020,10 +1027,15 @@ def _normalize_language_code(raw: Any) -> str | None:
     """whisper 的语言代码是 2~3 位字母（en / ja / kor…）。
 
     解析失败时不要返回 "0.93" 这种数字串：它会伪装成合法语言污染后续统计。
+    兼容枚举（Language.JA）与带区域后缀的写法（EN-US）。
     """
     if raw is None:
         return None
     text = str(raw).strip().lower()
+    if "." in text:
+        text = text.rsplit(".", 1)[-1]
+    if "-" in text:
+        text = text.split("-", 1)[0]
     if 2 <= len(text) <= 3 and text.isalpha():
         return text
     return None
@@ -1054,14 +1066,21 @@ def _parse_language_result(result: Any) -> tuple[str | None, float]:
     """兼容 faster-whisper / murmurai 各版本的 detect_language 返回值。
 
     已知形态：
-        1. (language, probability, all_probs)          —— faster-whisper 1.x
-        2. LanguageDetection(language, language_probability) —— 新版本 dataclass
-        3. dict / 反序 tuple (probability, language)   —— 第三方封装
-        4. 字段名叫 probability / prob / confidence    —— 版本漂移
+        1. "ja"                                        —— 只返回语言字符串（murmurai 实测）
+        2. (language, probability, all_probs)          —— faster-whisper 1.x
+        3. LanguageDetection(language, language_probability) —— 新版本 dataclass
+        4. dict / 反序 tuple (probability, language)   —— 第三方封装
+        5. 字段名叫 probability / prob / confidence    —— 版本漂移
     解析不出来就返回 (None, 0.0)，由上层当作「未知」处理，不再静默当成整片单语。
     """
     if result is None:
         return None, 0.0
+
+    # murmurai 的 detect_language 只返回语言字符串时，拿不到置信度；
+    # 视为高置信（否则所有窗口都会被当成未知，整片退回单语解码）。
+    if isinstance(result, str):
+        code = _normalize_language_code(result)
+        return code, (1.0 if code else 0.0)
 
     raw_language: Any = None
     raw_probability: Any = None
