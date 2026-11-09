@@ -1589,6 +1589,20 @@ def _split_segment_by_words(seg: dict, turns: Sequence[DiarTurn]) -> list[dict] 
     if len(words) < 2:
         return None
 
+    # 对齐模型在音乐 / 音效 / 语言错配时会输出逐字符 token（H/e/l/l/o）。
+    # 用这种 words 重拼整句会把正常分词破坏成 "andshewiththe..."，
+    # 此时放弃按词拆段，保留 whisper 原始 text（宁可少拆，也不毁文本）。
+    tokens = [str(w.get("word", "")).strip() for w in words]
+    single_latin = sum(
+        1 for token in tokens if len(token) == 1 and token.isascii() and token.isalpha()
+    )
+    if len(words) >= 4 and single_latin / len(words) >= 0.5:
+        logger.debug(
+            "对齐结果字符级占比 %.0f%%（%d/%d），放弃按词拆段",
+            single_latin / len(words) * 100, single_latin, len(words),
+        )
+        return None
+
     labels: list[str | None] = [
         _speaker_for_span(float(w["start"]), float(w["end"]), turns) for w in words
     ]

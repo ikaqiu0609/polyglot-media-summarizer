@@ -677,6 +677,17 @@ def test_language_windows_low_confidence_uses_context() -> None:
     assert [(s.start, s.end, s.language) for s in spans] == [(0, 75, "en")]
 
 
+def test_split_segment_by_words_skips_char_level_alignment() -> None:
+    # 对齐异常时 words 会变成逐字符 token，重拼会把 "Hello" 变成 "H e l l o"
+    turns = [transcribe.DiarTurn(0, 2.0, "A"), transcribe.DiarTurn(2.0, 4.0, "B")]
+    words = [
+        {"word": ch, "start": index * 0.4, "end": index * 0.4 + 0.4}
+        for index, ch in enumerate("Hello")
+    ]
+    seg = {"start": 0.0, "end": 2.0, "text": "Hello", "words": words}
+    assert transcribe._split_segment_by_words(seg, turns) is None
+
+
 def test_language_switch_count_ignores_same_language_splits() -> None:
     spans = [
         transcribe.LanguageSpan(0, 50, "ja"),
