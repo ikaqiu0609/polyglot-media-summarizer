@@ -147,6 +147,69 @@ def test_diarize_skips_fully_silent_audio() -> None:
         assert transcribe.diarize(_UnexpectedPipeline(), path) == []
 
 
+def test_transcribe_task_runs_diarization_before_asr_load() -> None:
+    """显存优化：必须先分离、释放 pyannote，再加载 ASR（两个模型不同时驻留）。"""
+    order: list[str] = []
+
+    class _FakePipeline:
+        def to(self, device):
+            return self
+
+    def fake_build():
+        order.append("build")
+        return _FakePipeline()
+
+    def fake_diarize(pipeline, path, **kwargs):
+        order.append("diarize")
+        return [_turn(0.0, 1.0, "A")]
+
+    def fake_load_model():
+        order.append("load_asr")
+        return object()
+
+    def fake_transcribe(model, path, batch, language):
+        order.append("transcribe")
+        return {
+            "language": "en",
+            "segments": [
+                {
+                    "start": 0.0,
+                    "end": 1.0,
+                    "text": "hello world",
+                    "words": [
+                        {"word": "hello", "start": 0.0, "end": 0.4},
+                        {"word": "world", "start": 0.5, "end": 1.0},
+                    ],
+                }
+            ],
+        }
+
+    patched = {
+        "build_diarization_pipeline": fake_build,
+        "diarize": fake_diarize,
+        "load_asr_model": fake_load_model,
+        "_transcribe_chunk": fake_transcribe,
+        "_align_segments": lambda segments, path, language: segments,
+        "free_cuda_memory": lambda: None,
+    }
+    originals = {name: getattr(transcribe, name) for name in patched}
+    for name, func in patched.items():
+        setattr(transcribe, name, func)
+    transcribe._DIAR_UNAVAILABLE = ""
+    try:
+        chunk = audio.AudioChunk(
+            index=0, path=Path("x.wav"), start_sec=0.0, duration_sec=1.0, source=Path("x.wav")
+        )
+        payload = transcribe.transcribe_task([chunk], language="en", do_diarize=True)
+    finally:
+        for name, func in originals.items():
+            setattr(transcribe, name, func)
+
+    assert order == ["build", "diarize", "load_asr", "transcribe"]
+    assert payload["diarized"] is True
+    assert payload["speakers"] == ["Speaker 1"]
+
+
 def test_diarization_input_trims_silence_and_offsets() -> None:
     sr = 16000
     with tempfile.TemporaryDirectory() as tmp:

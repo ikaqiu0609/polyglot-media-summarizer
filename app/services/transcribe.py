@@ -1,9 +1,10 @@
 """转录 + 说话人分离模块（纯本地推理，不调用任何云端 ASR）。
 
-流程：
-    1. murmurai（WhisperX fork，`import murmurai` 等价于 `import whisperx`）加载 ASR 模型；
-    2. 对**整段 16k wav** 跑一次 Pyannote 3.1 说话人分离 —— 只在整段上跑，
+流程（顺序对显存峰值很关键）：
+    1. 对**整段 16k wav** 跑一次 Pyannote 3.1 说话人分离 —— 只在整段上跑，
        否则每片独立聚类，SPEAKER_00 在片与片之间根本不指同一个人；
+    2. 立即释放 pyannote 管线，再加载 murmurai（WhisperX fork）的 ASR 模型：
+       两个模型不同时常驻，8GB 卡上换 large-v3 才留得下余量；
     3. 逐片转录（切片信息来自 audio.py），把结果时间戳加回全局偏移；
     4. 用 word 级时间戳把跨说话人的 segment 拆开，再按说话人合并；
     5. 跨片边界做「同说话人 + 间隙很小」的合并，并去除切点重复文本；
@@ -259,6 +260,26 @@ def free_cuda_memory() -> None:
             torch.cuda.ipc_collect()
         except Exception:  # 某些驱动/容器环境下不可用，忽略即可
             pass
+
+
+def _reset_peak_vram() -> None:
+    """重置「峰值显存」计数器，用于分阶段统计（分离 / 转录）。"""
+    if not torch.cuda.is_available():
+        return
+    try:
+        torch.cuda.reset_peak_memory_stats()
+    except Exception:  # 老版本驱动/异常上下文下不可用，忽略
+        logger.debug("reset_peak_memory_stats 不可用", exc_info=True)
+
+
+def _peak_vram_mb() -> float:
+    """本阶段 CUDA 峰值分配（PyTorch allocator 口径，不等于 nvidia-smi 的总占用）。"""
+    if not torch.cuda.is_available():
+        return 0.0
+    try:
+        return round(torch.cuda.max_memory_allocated() / 1024 / 1024, 1)
+    except Exception:
+        return 0.0
 
 
 def _resolve_language(language: str | None) -> str | None:
@@ -1125,7 +1146,10 @@ def transcribe_task(
         _DIAR_LAST_ERROR = ""  # 只保留本任务的失败原因
 
     try:
-        model = load_asr_model()
+        # ---- 1. 整段说话人分离 ----
+        # 先分离、后加载 ASR：pyannote 约 1.5~2GB，若先加载 ASR 会两个模型同时常驻，
+        # 8GB 卡换 large-v3 时余量不足（分离完立刻释放，因此这段的峰值是独立的）。
+        _reset_peak_vram()
 
         if do_diarize and _DIAR_UNAVAILABLE:
             # 已经确认拉不起 pyannote（多为 gated repo 403）：本进程内不再重复下载权重
@@ -1162,7 +1186,7 @@ def transcribe_task(
                 report("diarizing", 1.0, "说话人分离失败，已降级为无标签转录")
                 turns = []
             finally:
-                # pyannote 与 ASR 模型同时常驻会多占约 2GB 显存，分离完立刻释放
+                # 分离完立刻释放，避免与随后加载的 ASR 模型同时占显存
                 if diar_pipeline is not None:
                     try:
                         diar_pipeline.to(torch.device("cpu"))
@@ -1171,7 +1195,11 @@ def transcribe_task(
                     del diar_pipeline
                     diar_pipeline = None
                     free_cuda_memory()
+                logger.info("分离阶段显存峰值 %.0f MB", _peak_vram_mb())
 
+        # ---- 2. 加载 ASR 模型并逐片转录 ----
+        model = load_asr_model()
+        _reset_peak_vram()  # 后续峰值只统计转录阶段（含对齐模型）
         total_chunks = len(chunks)
         for chunk in chunks:
             report("transcribing", chunk.index / total_chunks, f"转录切片 {chunk.index + 1}/{total_chunks}")
@@ -1306,12 +1334,13 @@ def transcribe_task(
                 "reason": (None if turns else _DIAR_UNAVAILABLE or _DIAR_LAST_ERROR) or None,
             },
             "speech_ratio": speech_ratio,
+            "peak_vram_mb": _peak_vram_mb(),
             "elapsed_sec": round(time.time() - started, 1),
         }
         logger.info(
-            "转录完成：%d 段 / %d 位说话人 / 语音占比 %.1f%% / 总耗时 %.1fs",
+            "转录完成：%d 段 / %d 位说话人 / 语音占比 %.1f%% / 转录峰值显存 %.0f MB / 总耗时 %.1fs",
             result_payload["num_segments"], len(result_payload["speakers"]),
-            speech_ratio * 100, result_payload["elapsed_sec"],
+            speech_ratio * 100, result_payload["peak_vram_mb"], result_payload["elapsed_sec"],
         )
         return result_payload
 
@@ -1327,7 +1356,10 @@ def transcribe_task(
             del diar_pipeline
         _clear_align_cache()
         free_cuda_memory()
-        logger.info("模型与显存已释放（可用显存 %.0f MB）", _available_vram_mb())
+        logger.info(
+            "模型与显存已释放（本任务峰值 %.0f MB，当前可用 %.0f MB）",
+            _peak_vram_mb(), _available_vram_mb(),
+        )
 
 
 def _available_vram_mb() -> float:

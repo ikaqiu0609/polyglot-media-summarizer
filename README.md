@@ -1032,6 +1032,7 @@ python -m app.services.summarizer ./demo.json --out ./summary.md
 
 - 与云端的主要差距在转录吞吐，不在分离；`medium` 比 `large-v3` 快 2~3 倍，精度下降主要体现在专业术语与韩/日文片段。
 - 显存吃紧时按优先级依次降：`ASR_BATCH_SIZE=2` → `ASR_MODEL=small` → `ENABLE_DIARIZATION=false`（省掉 pyannote 的约 2GB）。
+- 说话人分离**先于** ASR 模型加载，分离结束立即释放 pyannote，两个模型不会同时驻留；日志分别打印「分离阶段显存峰值」和「转录峰值显存」，`transcript.json` 的 `peak_vram_mb` 是转录阶段峰值（PyTorch allocator 口径，略低于 `nvidia-smi` 的总占用）。
 - 说话人分离是在**整段 wav** 上跑的，与切片数无关；长音频分离阶段的显存占用不会因为 `CHUNK_MINUTES` 变小而下降。
 - 上表的端到端时间**不含首次模型下载**：对齐开启且分离成功时，首次处理某语言还会下载约 1.2GB 的 wav2vec2 对齐模型（中文/韩语各一份）。分离失败或 `ASR_ALIGN=0` 时不会触发。
 
