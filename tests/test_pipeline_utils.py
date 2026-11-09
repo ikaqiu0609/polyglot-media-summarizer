@@ -256,6 +256,117 @@ def _with_fake_mm(fake, func):
         transcribe._ALIGN_UNAVAILABLE.clear()
 
 
+def test_looks_like_network_error() -> None:
+    assert transcribe._looks_like_network_error(Exception("HTTP Error 504: Gateway Time-out"))
+    assert transcribe._looks_like_network_error(Exception("Max retries exceeded with url"))
+    assert transcribe._looks_like_network_error(Exception("[Errno -2] Name or service not known"))
+    assert not transcribe._looks_like_network_error(ValueError("bad model name"))
+
+    hint = transcribe._model_load_hint("medium", Exception("HTTP Error 504: Gateway Time-out"))
+    assert "ASR_OFFLINE=1" in hint and "网络错误" in hint
+
+
+# ---------------------------------------------------------------------------
+# main: 失败任务重跑
+# ---------------------------------------------------------------------------
+def test_retry_task_requeues_failed_task() -> None:
+    import uuid
+
+    from fastapi import BackgroundTasks
+
+    from app import main as app_main
+
+    task_id = uuid.uuid4().hex
+    with tempfile.TemporaryDirectory() as tmp:
+        media = Path(tmp) / "x.m4a"
+        media.write_bytes(b"\x00" * 16)
+        app_main._register(
+            app_main.TaskRecord(
+                task_id=task_id,
+                filename="x.m4a",
+                source_path=media,
+                size_bytes=16,
+                status=app_main.TaskStatus.FAILED,
+                detail="处理失败",
+                error="boom",
+            )
+        )
+        try:
+            response = app_main.retry_task(task_id, BackgroundTasks())
+            assert response.status == app_main.TaskStatus.QUEUED
+
+            record = app_main._get(task_id)
+            assert record.status == app_main.TaskStatus.QUEUED
+            assert record.error is None and record.result is None
+
+            try:
+                app_main.retry_task(task_id, BackgroundTasks())
+            except Exception as exc:  # HTTPException
+                assert getattr(exc, "status_code", None) == 409
+            else:
+                raise AssertionError("处理中的任务重复重跑应返回 409")
+        finally:
+            with app_main._tasks_lock:
+                app_main._tasks.pop(task_id, None)
+
+
+def test_restore_orphan_uploads() -> None:
+    import uuid
+    from dataclasses import replace
+
+    from app import main as app_main
+
+    original = app_main.settings
+    task_id = uuid.uuid4().hex
+    with tempfile.TemporaryDirectory() as tmp:
+        upload_dir = Path(tmp)
+        (upload_dir / f"{task_id}.m4a").write_bytes(b"\x00" * 8)
+        app_main.settings = replace(
+            original, upload_dir=upload_dir, task_retention_hours=24.0
+        )
+        try:
+            assert app_main._restore_orphan_uploads() == 1
+            record = app_main._get(task_id)
+            assert record is not None
+            assert record.status == app_main.TaskStatus.FAILED
+            assert record.result["retry_url"] == f"/retry/{task_id}"
+            # 再跑一次不应重复注册
+            assert app_main._restore_orphan_uploads() == 0
+        finally:
+            app_main.settings = original
+            with app_main._tasks_lock:
+                app_main._tasks.pop(task_id, None)
+
+
+def test_retry_task_rejects_missing_upload() -> None:
+    import uuid
+
+    from fastapi import BackgroundTasks
+
+    from app import main as app_main
+
+    task_id = uuid.uuid4().hex
+    app_main._register(
+        app_main.TaskRecord(
+            task_id=task_id,
+            filename="gone.m4a",
+            source_path=Path("/nonexistent/gone.m4a"),
+            size_bytes=1,
+            status=app_main.TaskStatus.FAILED,
+        )
+    )
+    try:
+        try:
+            app_main.retry_task(task_id, BackgroundTasks())
+        except Exception as exc:  # HTTPException
+            assert getattr(exc, "status_code", None) == 410
+        else:
+            raise AssertionError("上传文件不存在时应返回 410")
+    finally:
+        with app_main._tasks_lock:
+            app_main._tasks.pop(task_id, None)
+
+
 def test_align_segments_uses_cached_model() -> None:
     fake = _FakeAlignModule()
 

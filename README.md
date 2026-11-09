@@ -783,7 +783,14 @@ data/uploads/{task_id}.mp4                ← 原始上传文件
 
 ### `POST /upload`
 
-`multipart/form-data`，字段名固定为 `file`。响应码 `202`。
+`multipart/form-data`，响应码 `202`。
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `file` | file | 必填，媒体文件 |
+| `speakers` | int | 可选（1~20），已知说话人数；直接作为 pyannote 的 min/max |
+
+响应字段：
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
@@ -797,6 +804,17 @@ data/uploads/{task_id}.mp4                ← 原始上传文件
 
 > 上传只负责「抽取 + 转录」。默认流程会停在 `transcribed`，**不会自动调用付费 API**。
 
+### `POST /retry/{task_id}`
+
+用**已上传、仍保留的原始文件**重跑转录，不需要重新上传。适用于模型加载失败、HF 网络抖动、显存不足等情况。
+
+| 场景 | 响应 |
+|---|---|
+| `failed` / `transcribed` / `completed`，且上传文件存在 | `202`，重新排队（`status=queued`） |
+| `queued` / `extracting` / `diarizing` / `transcribing` / `summarizing` | `409` 正在处理中 |
+| 任务来自导入的转录 JSON（无媒体文件） | `409` |
+| 上传文件超过保留期被清理 | `410` |
+
 ### `POST /summarize/{task_id}`
 
 对已完成转录的任务触发总结。**会调用 DeepSeek API 并产生费用。**
@@ -807,7 +825,7 @@ data/uploads/{task_id}.mp4                ← 原始上传文件
 |---|---|
 | `transcribed` 或 `failed`（且 JSON 存在） | `202`，开始总结（GPU 忙时排队） |
 | `queued` / `extracting` / `diarizing` / `transcribing` | `409` 任务尚未转录完成 |
-| `summarizing` | `409` 正在总结，勿重复触发 |
+| `summarizing` | `202`，幂等返回「已在总结中」，不会重复计费 |
 | `completed` 且 `.md` 已存在 | `409` 总结已存在（避免重复计费） |
 
 ### `POST /summarize`
@@ -839,7 +857,7 @@ data/uploads/{task_id}.mp4                ← 原始上传文件
 
 ### `GET /healthz`
 
-`ffmpeg`/`ffprobe` 是否可用、脱敏后的配置快照、内存中任务数、等待总结的任务数（`pending_summary`）。**不返回任何密钥。**
+`ffmpeg`/`ffprobe` 是否可用、脱敏后的配置快照、内存中任务数、等待总结的任务数（`pending_summary`）、媒体解码依赖（`media_io.soundfile` / `media_io.torchcodec`）、说话人分离状态（`diarization.input_mode` / `available` / `cached_reason` / `last_error`）。**不返回任何密钥。**
 
 ---
 
@@ -958,6 +976,7 @@ python -m app.services.summarizer ./demo.json --out ./summary.md
 | `ASR_BATCH_SIZE` | `16` | OOM 时自动减半重试，最多 2 次 |
 | `VAD_METHOD` | `silero` | 免额外许可；`pyannote` 需接受 `segmentation-3.0` 条款 |
 | `ASR_ALIGN` | `1` | 词级对齐开关（`0` 关闭）。对齐只用于「按说话人拆段」，没有说话人标签时一律跳过，避免按语言各下载 1.2GB wav2vec2 |
+| `ASR_OFFLINE` | `auto` | `auto`=联网失败（HF 504/代理不可达）时自动切 HF 离线模式重试一次；`1`=始终离线（模型已缓存时启动更快）；`0`=始终联网 |
 | `ASR_LANG_VOTE_SAMPLES` | `3` | 前 N 个「有语音」切片参与语言投票 |
 | `ASR_LANG_MIN_SHARE` | `0.8` | 某语言占比达到该阈值才锁定全局语言；多语内容/平票继续逐片检测，顶层 `language` 写 `multilingual` |
 | `DIARIZATION_MODEL` | `pyannote/speaker-diarization-3.1` | 保持 3.1；需 Agree 的模型见 [模型授权](#模型授权必读) |
@@ -1117,6 +1136,20 @@ ASR_LANGUAGE=ko
 </details>
 
 <details>
+<summary><b>上传后立刻失败：<code>ASR 模型加载失败（medium）: HTTP Error 504: Gateway Time-out</code></b></summary>
+
+这不是代码问题，而是加载模型时访问 HuggingFace（或你的代理）超时。即使权重已经在本地缓存，`snapshot_download` 默认仍会做一次远端元数据校验，网络不通就整段失败。
+
+处理顺序：
+
+1. **直接重跑**：`POST /retry/{task_id}`（上传文件还留着，不需要重新上传）；
+2. 确认模型已缓存（`%USERPROFILE%\.cache\huggingface\hub\models--Systran--faster-whisper-medium` 存在）后，在 `.env` 里设 `ASR_OFFLINE=1` 或 `HF_HUB_OFFLINE=1`，重启服务即可完全离线加载；
+3. 需要重新下载时，检查代理/VPN，或设 `HF_ENDPOINT=https://hf-mirror.com`。
+
+版本 ≥ 当前实现时，`ASR_OFFLINE=auto`（默认）会**自动**在遇到这类网络错误时切到离线模式重试一次，失败信息里也会给出上述提示。
+</details>
+
+<details>
 <summary><b>总结失败（402 余额不足 / 网络错误）后需要重新转录吗</b></summary>
 
 不需要。只要 `{task_id}.transcript.json` 还在，修复问题后重新 `POST /summarize/{task_id}` 即可，只重跑总结，不重新上传、不重新转录。`/status` 里的 `result.retry_url` 就是这个入口。
@@ -1131,7 +1164,12 @@ ASR_LANGUAGE=ko
 <details>
 <summary><b>重启后任务全丢了</b></summary>
 
-服务启动时会扫描 `data/outputs/*.transcript.json` 重建任务表：有对应 `.md` 的标为 `completed`，没有的标为 `transcribed`，因此重启后 `/summarize/{task_id}`、`/result/{task_id}` 仍然可用。但**运行中的任务**无法恢复，仍需替换 `app/main.py` 的 `_tasks` 为 Redis，并把 `BackgroundTasks` 换成 Celery/RQ。
+服务启动时会做两层恢复：
+
+1. 扫描 `data/outputs/*.transcript.json` 重建任务表：有对应 `.md` 的标为 `completed`，没有的标为 `transcribed`，因此重启后 `/summarize/{task_id}`、`/result/{task_id}` 仍然可用；
+2. 扫描 `data/uploads` 里「有文件但没有任务记录」的媒体（保留期内、最近 20 个），恢复成 `failed` 任务并带 `result.retry_url`，可直接 `POST /retry/{task_id}` 重跑，不需要重新上传。
+
+但**正在运行的任务**仍无法断点续跑，多副本/多 worker 仍需把 `_tasks` 换成 Redis、`BackgroundTasks` 换成 Celery/RQ。
 </details>
 
 ---

@@ -492,6 +492,18 @@ def _fail(task_id: str, message: str) -> None:
                 "（不会重新转录，也不需要重新上传）。"
             ),
         }
+    else:
+        # 转录阶段就失败（模型加载、网络、显存）：上传文件还留着，可以直接重跑
+        record = _get(task_id)
+        # 导入转录 JSON 的任务 source_path 就是 transcript 本身，没有媒体可重跑
+        if record is not None and record.source_path.exists() and record.source_path != transcript:
+            result = {
+                "retry_url": f"/retry/{task_id}",
+                "hint": (
+                    "原始上传文件仍在。修复环境（网络、模型缓存、显存等）后 "
+                    "POST /retry/{task_id} 可直接重跑，无需重新上传。"
+                ),
+            }
     _update(
         task_id,
         force=True,
@@ -547,6 +559,59 @@ def _restore_tasks_from_outputs() -> int:
 
     if restored:
         logger.info("从 %s 恢复 %d 个历史任务", settings.output_dir, restored)
+    return restored
+
+
+def _restore_orphan_uploads(limit: int = 20) -> int:
+    """把 uploads 里「有文件但没有任务记录」的媒体恢复成 failed 任务。
+
+    典型场景：模型加载失败（网络/显存）后重启服务 —— 任务表在内存里丢了，
+    但 82MB 的上传文件还在。恢复后可以直接 `POST /retry/{task_id}`，
+    不必重新上传。
+    """
+    if not settings.upload_dir.exists():
+        return 0
+
+    deadline = time.time() - max(settings.task_retention_hours, 0) * 3600
+    candidates: list[tuple[float, str, Path]] = []
+    for path in settings.upload_dir.iterdir():
+        if not path.is_file() or path.suffix.lower() not in settings.allowed_extensions:
+            continue
+        task_id = path.name.split(".")[0]
+        if len(task_id) != 32 or _get(task_id) is not None:
+            continue
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            continue
+        if settings.task_retention_hours > 0 and mtime < deadline:
+            continue
+        candidates.append((mtime, task_id, path))
+
+    restored = 0
+    # 只恢复最近的若干个，避免历史残留把任务表撑满
+    for mtime, task_id, path in sorted(candidates, reverse=True)[:limit]:
+        uploaded_at = datetime.fromtimestamp(mtime, tz=timezone.utc)
+        record = TaskRecord(
+            task_id=task_id,
+            filename=path.name,
+            source_path=path,
+            size_bytes=path.stat().st_size,
+            status=TaskStatus.FAILED,
+            detail="服务重启，任务中断",
+            error="服务重启导致任务中断；可 POST /retry/{task_id} 重跑（无需重新上传）",
+            created_at=uploaded_at,
+            finished_at=uploaded_at,
+        )
+        record.result = {
+            "retry_url": f"/retry/{task_id}",
+            "hint": "原始上传文件仍在，POST /retry/{task_id} 可重跑转录。",
+        }
+        _register(record)
+        restored += 1
+
+    if restored:
+        logger.info("从 uploads 恢复 %d 个未完成任务（可直接 /retry）", restored)
     return restored
 
 
@@ -644,6 +709,7 @@ async def lifespan(_: FastAPI):
     settings.ensure_dirs()
     logger.info("启动配置：%s", json.dumps(settings.as_dict(), ensure_ascii=False))
     _restore_tasks_from_outputs()
+    _restore_orphan_uploads()
     if not shutil.which("ffmpeg"):
         logger.error("环境中找不到 ffmpeg，音频抽取会失败")
     if settings.enable_diarization and not settings.hf_token_present:
@@ -721,6 +787,58 @@ async def upload(
         status=TaskStatus.QUEUED,
         filename=filename,
         size_bytes=size,
+        status_url=f"/status/{task_id}",
+        result_url=f"/result/{task_id}",
+    )
+
+
+@app.post(
+    "/retry/{task_id}",
+    response_model=UploadResponse,
+    status_code=202,
+    summary="用已上传的文件重跑转录（无需重新上传）",
+)
+def retry_task(task_id: str, background_tasks: BackgroundTasks) -> UploadResponse:
+    """模型加载失败 / 网络抖动 / 显存不足后，重跑同一个任务。
+
+    只适用于「原始上传文件还在」的任务（`/upload` 创建的）。导入转录 JSON 的任务
+    没有媒体文件，只能走 `/summarize`。
+    """
+    record = _get(task_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail=f"任务不存在：{task_id}")
+    if record.status not in {TaskStatus.FAILED, TaskStatus.TRANSCRIBED, TaskStatus.COMPLETED}:
+        raise HTTPException(
+            status_code=409,
+            detail=f"任务正在处理中（{record.status.value}），请等结束后再重跑",
+        )
+    if record.source_path == settings.transcript_path(task_id):
+        raise HTTPException(
+            status_code=409, detail="该任务来自导入的转录 JSON，没有原始媒体，无法重跑转录"
+        )
+    if not record.source_path.exists():
+        raise HTTPException(
+            status_code=410, detail="原始上传文件已被清理（超过保留期），请重新上传"
+        )
+
+    _update(
+        task_id,
+        force=True,
+        status=TaskStatus.QUEUED,
+        progress=0.0,
+        detail="已重新排队",
+        error=None,
+        finished_at=None,
+        summary_path=None,
+        result=None,
+    )
+    background_tasks.add_task(run_pipeline, task_id, record.speaker_count)
+    logger.info("任务 %s 收到重跑请求（%s）", task_id, record.filename)
+    return UploadResponse(
+        task_id=task_id,
+        status=TaskStatus.QUEUED,
+        filename=record.filename,
+        size_bytes=record.size_bytes,
         status_url=f"/status/{task_id}",
         result_url=f"/result/{task_id}",
     )
@@ -910,6 +1028,7 @@ def healthz() -> dict[str, Any]:
             "torchcodec": _module_available("torchcodec"),
         },
         "diarization": transcribe.diarization_status(),
+        "asr_offline": transcribe.ASR_OFFLINE,
         "config": settings.as_dict(),
         "tasks_in_memory": total,
         "pending_summary": pending_summary,

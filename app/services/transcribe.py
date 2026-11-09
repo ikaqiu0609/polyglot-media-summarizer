@@ -70,6 +70,13 @@ BATCH_SIZE = int(os.getenv("ASR_BATCH_SIZE", "16"))
 LANGUAGE = os.getenv("ASR_LANGUAGE", "auto")
 VAD_METHOD = os.getenv("VAD_METHOD", "silero")  # silero（无需额外许可） / pyannote
 
+# 模型加载是否需要联网：
+#   auto（默认）—— 先常规加载；遇到网络类错误时切到 HF 离线模式重试一次，
+#                  模型权重已缓存即可直接恢复（典型场景：HF 504 / 代理挂了）
+#   1            —— 始终离线（内网/容器，模型已预热）
+#   0            —— 始终联网，不做离线重试
+ASR_OFFLINE = (os.getenv("ASR_OFFLINE", "auto") or "auto").strip().lower()
+
 # 词级对齐开关：
 #   1 / true（默认）—— 需要说话人标签时才对齐（对齐结果只用于「按说话人拆段」）。
 #   0 / false       —— 完全关闭。
@@ -260,6 +267,50 @@ def _resolve_language(language: str | None) -> str | None:
 
 
 # ---------------------------------------------------------------------------
+# 离线兜底（HuggingFace 504 / 代理不可用时，已缓存的模型仍可加载）
+# ---------------------------------------------------------------------------
+_NETWORK_ERROR_SIGNS = (
+    "connection", "connect", "timed out", "timeout", "time-out", "gateway",
+    "502", "503", "504", "ssl", "proxy", "getaddrinfo", "name or service not known",
+    "temporary failure", "network is unreachable", "max retries exceeded",
+)
+
+
+def _looks_like_network_error(exc: Exception) -> bool:
+    text = f"{type(exc).__name__}: {exc}".lower()
+    return any(sign in text for sign in _NETWORK_ERROR_SIGNS)
+
+
+def _enable_offline_mode() -> None:
+    """强制 huggingface_hub 只读本地缓存（不再做远端元数据校验）。
+
+    注意：huggingface_hub 在 import 时就把 HF_HUB_OFFLINE 读进常量，
+    因此除了设环境变量，还要把常量一起改掉，运行中切换才立即生效。
+    """
+    os.environ["HF_HUB_OFFLINE"] = "1"
+    os.environ["TRANSFORMERS_OFFLINE"] = "1"
+    try:
+        import huggingface_hub.constants as hf_constants  # noqa: PLC0415
+    except Exception:  # noqa: BLE001
+        return
+    for attr in ("HF_HUB_OFFLINE", "HF_HUB_OFFLINE_MODE"):
+        if hasattr(hf_constants, attr):
+            setattr(hf_constants, attr, True)
+
+
+def _model_load_hint(name: str, exc: Exception) -> str:
+    """把模型加载错误翻译成可操作的提示（区分网络问题与其它问题）。"""
+    if _looks_like_network_error(exc):
+        return (
+            f"ASR 模型加载失败（{name}）: {exc}。"
+            "这是下载/校验模型时的网络错误（HuggingFace 或代理不可达），不是代码问题。"
+            "模型已缓存时：在 .env 设 ASR_OFFLINE=1（或 HF_HUB_OFFLINE=1）后重启即可离线加载；"
+            "需要重新下载时：检查代理/VPN，或设 HF_ENDPOINT=https://hf-mirror.com。"
+        )
+    return f"ASR 模型加载失败（{name}）: {exc}"
+
+
+# ---------------------------------------------------------------------------
 # 模型加载
 # ---------------------------------------------------------------------------
 def load_asr_model(model_name: str | None = None) -> Any:
@@ -286,12 +337,26 @@ def load_asr_model(model_name: str | None = None) -> Any:
         if cache_key:
             kwargs[cache_key] = MODEL_DIR
 
+    if ASR_OFFLINE == "1":
+        _enable_offline_mode()
+
     logger.info("加载 ASR 模型 %s（device=%s, compute_type=%s, vad=%s）", name, DEVICE, COMPUTE_TYPE, VAD_METHOD)
     started = time.time()
+    call_kwargs = _filter_kwargs(mm.load_model, kwargs)
     try:
-        model = mm.load_model(name, **_filter_kwargs(mm.load_model, kwargs))
+        model = mm.load_model(name, **call_kwargs)
     except Exception as exc:
-        raise TranscriptionError(f"ASR 模型加载失败（{name}）: {exc}") from exc
+        # 网络类错误且处于 auto 模式：切离线重试一次（权重已缓存时能直接恢复）
+        if ASR_OFFLINE != "auto" or not _looks_like_network_error(exc):
+            raise TranscriptionError(_model_load_hint(name, exc)) from exc
+
+        logger.warning("ASR 模型加载遇到网络错误（%s），切换 HF 离线模式重试一次", exc)
+        _enable_offline_mode()
+        logger.warning("本进程后续模型加载将只读本地缓存（重启服务后恢复联网）")
+        try:
+            model = mm.load_model(name, **call_kwargs)
+        except Exception as retry_exc:
+            raise TranscriptionError(_model_load_hint(name, retry_exc)) from retry_exc
     logger.info("ASR 模型加载完成 %.1fs", time.time() - started)
     return model
 
