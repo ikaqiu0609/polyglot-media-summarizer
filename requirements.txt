@@ -23,6 +23,12 @@ murmurai-core==1.0.6
 # pyannote comes with murmurai-core; pin the major version to avoid breaking changes in 5.x
 pyannote.audio>=4.0,<5
 
+# Speaker diarization reads the 16k PCM wav itself and passes a waveform dict to
+# pyannote, which avoids torchcodec (version-locked to torch, and on Windows it
+# also needs shared FFmpeg DLLs). Usually already installed by pyannote; pin it
+# explicitly so a trimmed environment does not lose it.
+soundfile>=0.12.1
+
 # LLM summarization (DeepSeek, OpenAI-compatible API)
 openai>=1.55.0
 

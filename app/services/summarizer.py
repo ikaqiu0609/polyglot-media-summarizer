@@ -126,6 +126,42 @@ SINGLE_SPEAKER_SYSTEM_PROMPT = """你是一位资深的多语言内容分析师�
 ## 五、术语与专有名词
 表格形式：| 原文 | 中文解释 | 出现时间 |"""
 
+MULTI_UNLABELED_SYSTEM_PROMPT = """你是一位资深的多语言内容分析师，擅长把口语化的音视频转录整理成可直接阅读的中文结构化总结。
+
+注意：这是**多人对话**（访谈 / 新闻 / 节目），但本次转录**没有做说话人分离**，文本里没有可靠的说话人标签。请按「多人在交谈」处理：不要假设只有一个讲述者，也不要编造 Speaker 1 / 说话人 1 这类标签；需要指代时用角色泛称（主持人、嘉宾、旁白、介绍人等），无法判断时用「有人提到」。
+
+硬性规则（必须全部遵守）：
+1. 全部使用简体中文输出。人名、公司名、产品名、技术术语保留原文（英文/韩文/日文），首次出现时用括号给出中文解释，例如：Retrieval-Augmented Generation（检索增强生成）。
+2. 时间戳必须保留，格式为 HH:MM:SS，只在「章节脉络」和「关键观点」中使用，且只能使用转录中真实出现过的时间点，严禁编造或估算。
+3. 不要输出「说话人观察」章节：没有分离结果，任何关于说话人身份的归纳都只能是猜测。
+4. 严格区分三类信息：转录中明确陈述的事实、说话人的主观观点、以及尚待确认的疑问。事实要写清楚数据与条件（数字、时间、版本、比例等）。
+5. 若转录中出现韩语、日语或混合语言片段，先给出中文意译，再在括号内保留关键词原文。
+6. 禁止编造转录中不存在的内容；信息不足时写「转录中未提及」，不要用常识补全。
+7. 输出纯 Markdown，不要用代码块包裹整篇总结，不要输出「以下是总结」这类寒暄。
+
+固定输出结构：
+# {一句话标题：说清主题与结论倾向}
+> 时长 HH:MM:SS ｜ 多人对话（未分离说话人） ｜ 检测语言 xx
+
+## 一、内容概览
+3~6 句话说明：这是什么内容、讨论了什么、结论是什么。让没看过原文的人 1 分钟能抓住重点。
+
+## 二、章节脉络
+按时间顺序分 3~8 个章节，每章一个小标题，格式：
+### [HH:MM:SS - HH:MM:SS] 章节标题
+- 该章节讲了什么（2~4 条，能判断角色时用角色泛称）
+
+## 三、关键观点与事实
+按主题（不是按时间）归纳，每条格式：
+- **观点/结论**：具体内容 ｜ 来源：主持人/嘉宾（可判断时）｜ 依据：数据/例子（如有）
+把有分歧的地方单独列出：`分歧点：一方认为…，另一方认为…`。
+
+## 四、待办与未解决问题
+明确提到的行动项（做什么、什么时候）与悬而未决的问题；没有就写「无」。
+
+## 五、术语与专有名词
+表格形式：| 原文 | 中文解释 | 出现时间 |"""
+
 LOCAL_SYSTEM_PROMPT = """你是音视频转录的片段压缩器。你的任务是把一小段带时间戳的转录压缩为结构化 JSON，供后续全局汇总使用。
 
 要求：
@@ -463,10 +499,20 @@ def _valid_timestamps(block: TranscriptBlock) -> set[str]:
     return stamps
 
 
-def _speaker_label(speakers: Sequence[str], diarized: bool) -> str:
-    if not diarized:
-        return "未做说话人分离（单人口播）"
-    return "、".join(speakers) or "未知"
+def _speaker_label(speakers: Sequence[str], speaker_mode: str) -> str:
+    if speaker_mode == "labeled":
+        return "、".join(speakers) or "未知"
+    if speaker_mode == "multi_unlabeled":
+        return "多人对话（未做说话人分离，无说话人标签）"
+    return "未做说话人分离（单人口播）"
+
+
+def _system_prompt(speaker_mode: str) -> str:
+    if speaker_mode == "labeled":
+        return SYSTEM_PROMPT
+    if speaker_mode == "multi_unlabeled":
+        return MULTI_UNLABELED_SYSTEM_PROMPT
+    return SINGLE_SPEAKER_SYSTEM_PROMPT
 
 
 def summarize_block(
@@ -475,7 +521,7 @@ def summarize_block(
     duration: float,
     language: str,
     speakers: Sequence[str],
-    diarized: bool = True,
+    speaker_mode: str = "labeled",
 ) -> dict:
     """对一个 block 做局部摘要，失败时返回兜底结构（不阻断整体流程）。"""
     user_prompt = (
@@ -485,7 +531,7 @@ def summarize_block(
         .replace("%END%", format_timestamp(block.end))
         .replace("%DURATION%", format_timestamp(duration))
         .replace("%LANGUAGE%", language)
-        .replace("%SPEAKERS%", _speaker_label(speakers, diarized))
+        .replace("%SPEAKERS%", _speaker_label(speakers, speaker_mode))
         .replace("%TRANSCRIPT%", block.text)
     )
     messages = [
@@ -591,7 +637,7 @@ def global_summary(
     duration: float,
     speakers: Sequence[str],
     language: str,
-    diarized: bool = True,
+    speaker_mode: str = "labeled",
 ) -> tuple[str, dict]:
     """第二阶段：局部摘要 -> 全局中文 Markdown 总结。"""
     digest = build_digest(summaries)
@@ -599,13 +645,13 @@ def global_summary(
 
     user_prompt = (
         FINAL_USER_TEMPLATE.replace("%DURATION%", format_timestamp(duration))
-        .replace("%SPEAKERS%", _speaker_label(speakers, diarized))
+        .replace("%SPEAKERS%", _speaker_label(speakers, speaker_mode))
         .replace("%LANGUAGE%", language)
         .replace("%BLOCKS%", str(len(summaries)))
         .replace("%DIGEST%", digest)
     )
     messages = [
-        {"role": "system", "content": SYSTEM_PROMPT if diarized else SINGLE_SPEAKER_SYSTEM_PROMPT},
+        {"role": "system", "content": _system_prompt(speaker_mode)},
         {"role": "user", "content": user_prompt},
     ]
     content, usage = _chat(
@@ -615,7 +661,7 @@ def global_summary(
     )
     markdown = _strip_code_fence(content)
     markdown = _postprocess_markdown(
-        markdown, duration=duration, speakers=speakers, language=language, diarized=diarized
+        markdown, duration=duration, speakers=speakers, language=language, speaker_mode=speaker_mode
     )
     return markdown, usage
 
@@ -626,11 +672,13 @@ def _postprocess_markdown(
     duration: float,
     speakers: Sequence[str],
     language: str,
-    diarized: bool = True,
+    speaker_mode: str = "labeled",
 ) -> str:
     """补齐头部元信息，保证输出一定有「一级标题 + 元信息行」，即使模型漏写。"""
-    if diarized:
+    if speaker_mode == "labeled":
         meta = f"> 时长 {format_timestamp(duration)} ｜ 说话人 {len(speakers)} 位 ｜ 检测语言 {language}"
+    elif speaker_mode == "multi_unlabeled":
+        meta = f"> 时长 {format_timestamp(duration)} ｜ 多人对话（未分离说话人） ｜ 检测语言 {language}"
     else:
         meta = f"> 时长 {format_timestamp(duration)} ｜ 未做说话人分离 ｜ 检测语言 {language}"
     lines = markdown.strip().splitlines()
@@ -720,11 +768,25 @@ def _extract_segments(payload: Any) -> tuple[list[dict], dict]:
     # 导入的 JSON 可能没有 diarized 字段，此时以 speakers 是否有具名标签为准。
     named_speakers = any(str(name).strip().upper() not in {"", "UNKNOWN"} for name in speakers)
     diarized = named_speakers and payload.get("diarized") is not False
+
+    # 三态：有标签 / 多人但没分离出来 / 单人口播。
+    # 分离失败时如果一律按「单人口播」总结，会把双人访谈写成「讲述者认为…」。
+    diarization = payload.get("diarization")
+    diar_requested = bool(diarization.get("requested")) if isinstance(diarization, dict) else False
+    if diarized:
+        speaker_mode = "labeled"
+    elif diar_requested:
+        speaker_mode = "multi_unlabeled"
+    else:
+        speaker_mode = "single"
+
     meta = {
         "duration": float(payload.get("duration_sec") or 0.0),
         "language": str(payload.get("language") or "auto"),
         "speakers": speakers,
         "diarized": diarized,
+        "speaker_mode": speaker_mode,
+        "diarization": diarization if isinstance(diarization, dict) else None,
     }
     if meta["duration"] <= 0 and segments:
         meta["duration"] = segments[-1]["end"]
@@ -750,10 +812,14 @@ def summarize(
         raise SummarizationError("转录结果为空，无法生成总结")
 
     blocks = build_blocks(segments, max_chars=block_chars or SUMMARY_BLOCK_CHARS)
+    mode_label = {
+        "labeled": f"说话人 {meta['speakers']}",
+        "multi_unlabeled": "多人对话但未做说话人分离（多人口播 prompt）",
+        "single": "未做说话人分离（单人口播 prompt）",
+    }[meta["speaker_mode"]]
     logger.info(
         "开始总结：%d 段 / %d 块 / 时长 %s / %s",
-        len(segments), len(blocks), format_timestamp(meta["duration"]),
-        f"说话人 {meta['speakers']}" if meta["diarized"] else "未做说话人分离（单人口播 prompt）",
+        len(segments), len(blocks), format_timestamp(meta["duration"]), mode_label,
     )
 
     summaries: list[dict] = []
@@ -765,7 +831,7 @@ def summarize(
             duration=meta["duration"],
             language=meta["language"],
             speakers=meta["speakers"],
-            diarized=meta["diarized"],
+            speaker_mode=meta["speaker_mode"],
         )
         summaries.append(summary)
         for key in usage_total:
@@ -776,7 +842,7 @@ def summarize(
         duration=meta["duration"],
         speakers=meta["speakers"],
         language=meta["language"],
-        diarized=meta["diarized"],
+        speaker_mode=meta["speaker_mode"],
     )
     for key in usage_total:
         usage_total[key] += final_usage.get(key, 0)
@@ -794,6 +860,8 @@ def summarize(
             "language": meta["language"],
             "speakers": meta["speakers"],
             "diarized": meta["diarized"],
+            "speaker_mode": meta["speaker_mode"],
+            "diarization": meta["diarization"],
             "input_chars": sum(b.chars for b in blocks),
             "elapsed_sec": round(time.time() - started, 1),
         },

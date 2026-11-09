@@ -19,6 +19,10 @@
       两条路都走不通才报错。
     - pyannote.audio 4.x 的 `pipeline(audio)` 返回 `DiarizeOutput`（真正结果在
       `.speaker_diarization`），3.x 直接返回 `Annotation`。这里统一归一化。
+    - pyannote.audio 4.x 默认用 torchcodec 解码音频，而 torchcodec 必须与 torch
+      版本严格匹配、且 Windows 上还需要共享版 FFmpeg DLL。因此默认**不走路径**，
+      而是自己把 16k PCM wav 读成 `{"waveform", "sample_rate"}` 再传给 pipeline
+      （`DIAR_AUDIO_INPUT=path` 可退回旧行为）。
 """
 
 from __future__ import annotations
@@ -56,27 +60,57 @@ BATCH_SIZE = int(os.getenv("ASR_BATCH_SIZE", "16"))
 LANGUAGE = os.getenv("ASR_LANGUAGE", "auto")
 VAD_METHOD = os.getenv("VAD_METHOD", "silero")  # silero（无需额外许可） / pyannote
 
-# 词级对齐三态：
-#   auto（默认）—— 只有说话人分离成功时才对齐。对齐结果仅用于「按说话人拆段」，
-#                  分离失败时它毫无用处，却会触发 1.2GB/语言的 wav2vec2 下载。
-#   1 / true    —— 强制对齐（即使没有说话人标签，也保留 word 级时间戳）。
-#   0 / false   —— 完全关闭。
-ALIGN_MODE = (os.getenv("ASR_ALIGN", "auto") or "auto").strip().lower()
+# 词级对齐开关：
+#   1 / true（默认）—— 需要说话人标签时才对齐（对齐结果只用于「按说话人拆段」）。
+#   0 / false       —— 完全关闭。
+# 注意：没有说话人标签时一律跳过。words 不会被写入 transcript.json，此时对齐
+# 没有任何消费方，却会触发 1.2GB/语言的 wav2vec2 下载（分离失败后尤其浪费）。
+ALIGN_MODE = (os.getenv("ASR_ALIGN", "1") or "1").strip().lower()
 ALIGN_ENABLED = ALIGN_MODE not in {"0", "false", "no", "off"}
-ALIGN_ONLY_WITH_DIARIZATION = ALIGN_MODE in {"auto", ""}
 
 DIARIZATION_MODEL = os.getenv("DIARIZATION_MODEL", "pyannote/speaker-diarization-3.1")
 DIAR_MIN_SPEAKERS = os.getenv("DIAR_MIN_SPEAKERS")  # 可选：已知说话人数时提升准确率
 DIAR_MAX_SPEAKERS = os.getenv("DIAR_MAX_SPEAKERS")
+
+# 说话人分离的音频输入形态：
+#   waveform（默认）—— 自己解码 16k PCM wav 并传 {"waveform", "sample_rate"}，
+#                     完全不依赖 torchcodec（4.x 上最常见的失败源）
+#   path             —— 直接把路径交给 pyannote，需要 torchcodec 可用
+DIAR_AUDIO_INPUT = (os.getenv("DIAR_AUDIO_INPUT", "waveform") or "waveform").strip().lower()
+# 整段 waveform 会常驻内存/显存：约 230MB/小时（16k float32）。超过该时长只告警。
+DIAR_MAX_HOURS = float(os.getenv("DIAR_MAX_HOURS", "2"))
+
+# 分离结果清洗：总时长过短的「幽灵说话人」（BGM/音效误聚类）并入最近的保留说话人
+DIAR_MIN_SPEAKER_SEC = float(os.getenv("DIAR_MIN_SPEAKER_SEC", "5"))
+DIAR_MIN_SPEAKER_SHARE = float(os.getenv("DIAR_MIN_SPEAKER_SHARE", "0.01"))
+# 永久性错误（403 / token）才进程级缓存；临时错误（OOM/网络）下一个任务重试
+DIAR_CACHE_FAILURE = (os.getenv("DIAR_CACHE_FAILURE", "1") or "1").strip().lower() not in {
+    "0", "false", "no", "off",
+}
+_PERMANENT_DIAR_SIGNS = (
+    "gated repo", "not in the authorized list", "401", "403", "invalid token",
+    "unauthorized", "token is required", "torchcodec is not available",
+)
+
+# 说话人指派：segment 与最近的 diarization turn 相距超过该值就标 UNKNOWN，
+# 否则音乐/空白区会被贴上几十秒外的说话人（宁可没标签，也不要贴错人）。
+MAX_SPEAKER_ATTACH_GAP = float(os.getenv("MAX_SPEAKER_ATTACH_GAP", "2.0"))
 
 MERGE_GAP_SEC = float(os.getenv("MERGE_GAP_SEC", "0.8"))       # 同说话人合并阈值
 # 没有说话人标签时，所有人都是 UNKNOWN，若沿用 0.8s 会把不同人的话揉进同一段
 MERGE_GAP_SEC_NO_DIAR = float(os.getenv("MERGE_GAP_SEC_NO_DIAR", "0.3"))
 MAX_MERGED_SEC = float(os.getenv("MAX_MERGED_SEC", "60"))        # 合并后单段上限，防止整集变一段
 
+# Whisper 幻觉过滤（BGM / 静音处的高频「感谢观看」类输出）
+HALLU_NO_SPEECH_PROB = float(os.getenv("HALLU_NO_SPEECH_PROB", "0.6"))
+HALLU_AVG_LOGPROB = float(os.getenv("HALLU_AVG_LOGPROB", "-1.0"))
+HALLU_COMPRESSION_RATIO = float(os.getenv("HALLU_COMPRESSION_RATIO", "2.4"))
+
 # 前 N 个「有语音」的切片各投一票决定全局语言，之后固定传给所有切片。
 # 逐片 auto 检测会让同一文件的语言来回跳（例如前 20 分钟被判成 en、之后是 ko）。
 LANG_VOTE_SAMPLES = max(1, int(os.getenv("ASR_LANG_VOTE_SAMPLES", "3")))
+# 只有当某个语言占比达到该阈值时才锁定；多语内容/平票继续逐片检测。
+LANG_VOTE_MIN_SHARE = float(os.getenv("ASR_LANG_MIN_SHARE", "0.7"))
 
 ASR_OPTIONS: dict[str, Any] = {
     # 长音频 + 无重叠切片场景下，关闭上文条件可显著减少「复读机」幻觉
@@ -114,9 +148,11 @@ _murmurai_mod: Any = None
 _ALIGN_CACHE: dict[str, tuple[Any, Any]] = {}
 # 本任务内已确认拉取失败的语言，避免每个切片都再试一次
 _ALIGN_UNAVAILABLE: set[str] = set()
-# 本进程内说话人分离不可用的原因（多为 gated repo 403）。
+# 本进程内说话人分离不可用的原因（只缓存永久性错误，多为 gated repo 403）。
 # 置为非空后不再重复下载 pyannote 权重，修复授权后重启服务即可恢复。
 _DIAR_UNAVAILABLE: str = ""
+# 最近一次分离失败的原因（含临时错误），用于 /healthz 与 transcript.json 的可诊断性
+_DIAR_LAST_ERROR: str = ""
 
 
 def _clear_align_cache() -> None:
@@ -136,6 +172,28 @@ def _mm():
         _murmurai_mod = murmurai
         logger.info("murmurai 导入完成 %.1fs", time.time() - started)
     return _murmurai_mod
+
+
+def _is_permanent_diar_error(text: str) -> bool:
+    """区分「配置/授权错误」与「临时错误（OOM、网络抖动）」。"""
+    lowered = text.lower()
+    return any(sign in lowered for sign in _PERMANENT_DIAR_SIGNS)
+
+
+def diarization_status() -> dict[str, Any]:
+    """说话人分离可用性快照（不含密钥），供 /healthz 与 /status 使用。"""
+    return {
+        "input_mode": DIAR_AUDIO_INPUT,
+        "available": not _DIAR_UNAVAILABLE,
+        "cached_reason": _DIAR_UNAVAILABLE or None,
+        "last_error": _DIAR_LAST_ERROR or None,
+    }
+
+
+def reset_diarization_cache() -> None:
+    """清空「分离不可用」缓存（例如装好 torchcodec / 重新 Agree 之后）。"""
+    global _DIAR_UNAVAILABLE, _DIAR_LAST_ERROR
+    _DIAR_UNAVAILABLE, _DIAR_LAST_ERROR = "", ""
 
 
 def _filter_kwargs(func: Any, kwargs: dict[str, Any]) -> dict[str, Any]:
@@ -270,19 +328,114 @@ def build_diarization_pipeline() -> Any:
     return pipeline
 
 
-def diarize(pipeline: Any, audio_path: str | Path) -> list[DiarTurn]:
+def _load_waveform(path: Path, target_sr: int = 16000) -> tuple[torch.Tensor, int]:
+    """把 16k wav 读成 pyannote 4.x 需要的 waveform 输入。
+
+    为什么不用路径：pyannote.audio 4.x 用 torchcodec 解码音频，而 torchcodec
+    必须与 torch 版本严格匹配、Windows 上还需要共享版 FFmpeg DLL，本地几乎必然
+    报「torchcodec is not available」。本项目已经用 FFmpeg 统一转成 16k PCM，
+    自己读一遍最稳，且不新增任何依赖（soundfile 随 pyannote/murmurai 一起装）。
+    """
+    path = Path(path)
+    try:
+        import soundfile as sf  # noqa: PLC0415 延迟导入
+    except ImportError:
+        return _load_waveform_stdlib(path, target_sr)
+
+    try:
+        data, sr = sf.read(str(path), dtype="float32", always_2d=True)
+    except Exception as exc:  # 损坏/非 WAV 时退回标准库再试一次
+        logger.warning("soundfile 读取失败（%s），改用标准库 wave 兜底", exc)
+        return _load_waveform_stdlib(path, target_sr)
+
+    if data.size == 0:
+        raise TranscriptionError(f"音频为空，无法做说话人分离: {path}")
+    if sr != target_sr:
+        raise TranscriptionError(f"采样率不是 {target_sr}Hz（实际 {sr}）: {path}")
+
+    waveform = torch.from_numpy(data.T).contiguous()  # (channel, time)
+    if waveform.size(0) > 1:
+        waveform = waveform.mean(dim=0, keepdim=True)
+    return waveform, sr
+
+
+def _load_waveform_stdlib(path: Path, target_sr: int) -> tuple[torch.Tensor, int]:
+    """soundfile 缺失时的兜底：本项目生成的 wav 一定是 16bit PCM。"""
+    import wave  # noqa: PLC0415
+
+    import numpy as np  # noqa: PLC0415
+
+    with wave.open(str(path), "rb") as handle:
+        channels = handle.getnchannels()
+        width = handle.getsampwidth()
+        sr = handle.getframerate()
+        frames = handle.readframes(handle.getnframes())
+
+    if sr != target_sr:
+        raise TranscriptionError(f"采样率不是 {target_sr}Hz（实际 {sr}）: {path}")
+    if width != 2:
+        raise TranscriptionError(f"仅支持 16bit PCM wav（实际 {width * 8}bit）: {path}")
+
+    audio = np.frombuffer(frames, dtype="<i2").astype("float32") / 32768.0
+    if channels > 1:
+        audio = audio.reshape(-1, channels).mean(axis=1)
+    return torch.from_numpy(audio).unsqueeze(0), sr
+
+
+def _diarization_input(audio_path: Path) -> Any:
+    """按 DIAR_AUDIO_INPUT 生成 pipeline 的输入。"""
+    if DIAR_AUDIO_INPUT == "path":
+        return str(audio_path)
+
+    try:
+        waveform, sr = _load_waveform(audio_path)
+    except TranscriptionError:
+        raise
+    except Exception as exc:
+        raise TranscriptionError(f"读取音频失败（{audio_path.name}）: {exc}") from exc
+
+    logger.info(
+        "说话人分离输入：waveform（%.0f MB, sr=%d）", waveform.numel() * 4 / 1e6, sr
+    )
+    return {"waveform": waveform, "sample_rate": sr}
+
+
+def _opt_int(raw: str | None) -> int | None:
+    try:
+        return int(raw) if raw else None
+    except ValueError:
+        return None
+
+
+def diarize(
+    pipeline: Any,
+    audio_path: str | Path,
+    min_speakers: int | None = None,
+    max_speakers: int | None = None,
+) -> list[DiarTurn]:
     """对整段音频做说话人分离，返回按时间排序的说话人时间片。"""
     kwargs: dict[str, Any] = {}
-    if DIAR_MIN_SPEAKERS:
-        kwargs["min_speakers"] = int(DIAR_MIN_SPEAKERS)
-    if DIAR_MAX_SPEAKERS:
-        kwargs["max_speakers"] = int(DIAR_MAX_SPEAKERS)
+    min_count = min_speakers or _opt_int(DIAR_MIN_SPEAKERS)
+    max_count = max_speakers or _opt_int(DIAR_MAX_SPEAKERS)
+    if min_count:
+        kwargs["min_speakers"] = int(min_count)
+    if max_count:
+        kwargs["max_speakers"] = int(max_count)
 
     audio_path = Path(audio_path)
-    logger.info("开始说话人分离: %s（%.1fs 音频）", audio_path.name, probe_duration(audio_path))
+    duration = probe_duration(audio_path)
+    logger.info("开始说话人分离: %s（%.1fs 音频）", audio_path.name, duration)
+    if duration / 3600 > DIAR_MAX_HOURS:
+        logger.warning(
+            "音频 %.1fh 超过 DIAR_MAX_HOURS=%.1f：waveform 将常驻约 %.0f MB 内存/显存",
+            duration / 3600, DIAR_MAX_HOURS, duration * 16000 * 4 / 1e6,
+        )
+
     started = time.time()
     try:
-        output = pipeline(str(audio_path), **kwargs)
+        output = pipeline(_diarization_input(audio_path), **kwargs)
+    except TranscriptionError:
+        raise
     except Exception as exc:
         raise TranscriptionError(f"说话人分离推理失败: {exc}") from exc
 
@@ -302,6 +455,54 @@ def diarize(pipeline: Any, audio_path: str | Path) -> list[DiarTurn]:
         time.time() - started, len(turns), len(speakers), sorted(speakers),
     )
     return turns
+
+
+def _gap(a_start: float, a_end: float, b_start: float, b_end: float) -> float:
+    """两个时间片之间的间隔（重叠时为 0）。"""
+    return max(0.0, b_start - a_end, a_start - b_end)
+
+
+def _merge_short_speakers(turns: list[DiarTurn], total_duration: float) -> list[DiarTurn]:
+    """把总时长过短的「幽灵说话人」并入时间上最近的保留说话人。
+
+    pyannote 3.1 在 BGM / 音效多的素材上容易额外聚出只说了两三秒的说话人，
+    留着会让总结里出现「6 位说话人」这种明显错误的结果。
+    """
+    if len({t.speaker for t in turns}) <= 1:
+        return turns
+
+    durations: dict[str, float] = {}
+    for turn in turns:
+        durations[turn.speaker] = durations.get(turn.speaker, 0.0) + turn.duration
+
+    floor = max(DIAR_MIN_SPEAKER_SEC, total_duration * DIAR_MIN_SPEAKER_SHARE)
+    kept = {name for name, seconds in durations.items() if seconds >= floor}
+    if len(kept) == len(durations):
+        return turns
+    if len(kept) < 2:
+        # 过滤后只剩一个人：多半是单人素材或分离失败，保留原始标签更有诊断价值
+        logger.warning(
+            "说话人清洗会只剩 %d 位（阈值 %.1fs），跳过合并", len(kept), floor
+        )
+        return turns
+
+    kept_turns = [t for t in turns if t.speaker in kept]
+    merged: list[DiarTurn] = []
+    remapped: dict[str, str] = {}
+    for turn in turns:
+        if turn.speaker in kept:
+            merged.append(turn)
+            continue
+        nearest = min(
+            kept_turns, key=lambda k: _gap(turn.start, turn.end, k.start, k.end)
+        )
+        remapped.setdefault(turn.speaker, nearest.speaker)
+        merged.append(DiarTurn(start=turn.start, end=turn.end, speaker=nearest.speaker))
+
+    logger.info(
+        "说话人清洗：%d -> %d 位（合并 %s）", len(durations), len(kept), remapped
+    )
+    return merged
 
 
 # ---------------------------------------------------------------------------
@@ -376,6 +577,64 @@ def _align_segments(segments: list[dict], audio_path: Path, language: str) -> li
         return segments
 
 
+def _as_float(value: Any) -> float | None:
+    try:
+        return float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+
+
+def _norm_text(text: str) -> str:
+    """归一化文本用于重复检测：只保留字母/数字，忽略大小写与标点。"""
+    return "".join(ch for ch in text.lower() if ch.isalnum())
+
+
+def _filter_hallucinations(segments: list[dict]) -> list[dict]:
+    """过滤 Whisper 在 BGM / 静音处的典型幻觉。
+
+    三类规则（阈值均可用环境变量覆盖）：
+        1. compression_ratio 过高 —— 复读机式输出；
+        2. no_speech_prob 高且 avg_logprob 低 —— 这段其实没人说话；
+        3. 与上一段归一化后完全相同 —— 连续重复字幕。
+    少于 6 个有效字符的重复（例如「はい」「OK」）不算幻觉，避免误杀。
+    """
+    kept: list[dict] = []
+    dropped = {"compression": 0, "no_speech": 0, "duplicate": 0}
+    previous = ""
+
+    for seg in segments:
+        text = str(seg.get("text", "")).strip()
+        if not text:
+            continue
+
+        compression = _as_float(seg.get("compression_ratio"))
+        if compression is not None and compression > HALLU_COMPRESSION_RATIO:
+            dropped["compression"] += 1
+            continue
+
+        no_speech = _as_float(seg.get("no_speech_prob"))
+        logprob = _as_float(seg.get("avg_logprob"))
+        if (
+            no_speech is not None and no_speech >= HALLU_NO_SPEECH_PROB
+            and logprob is not None and logprob <= HALLU_AVG_LOGPROB
+        ):
+            dropped["no_speech"] += 1
+            continue
+
+        normalized = _norm_text(text)
+        if len(normalized) >= 6 and normalized == previous:
+            dropped["duplicate"] += 1
+            continue
+        previous = normalized
+
+        kept.append(seg)
+
+    total_dropped = sum(dropped.values())
+    if total_dropped:
+        logger.info("幻觉过滤：丢弃 %d 段（%s）", total_dropped, {k: v for k, v in dropped.items() if v})
+    return kept
+
+
 def _offset_segments(segments: list[dict], offset: float) -> None:
     """把局部时间戳（相对切片）加上切片起始偏移，还原为全局时间戳。"""
     if offset <= 0:
@@ -398,16 +657,20 @@ def _overlap(a_start: float, a_end: float, b_start: float, b_end: float) -> floa
 
 
 def _nearest_speaker(start: float, end: float, turns: Sequence[DiarTurn]) -> str | None:
-    """没重叠时（VAD 把静音裁掉了、或切片边界）退化为「时间上最近的说话人」。"""
+    """没重叠时（VAD 把静音裁掉了、或切片边界）退化为「时间上最近的说话人」。
+
+    但距离必须有上限：音乐/空白区的 segment 若被贴上 60 秒外的人，会被
+    postprocess 合并进那个人的段落里。宁可返回 None（最终标 UNKNOWN）。
+    """
     best: str | None = None
     best_gap = float("inf")
     for turn in turns:
         if _overlap(start, end, turn.start, turn.end) > 0:
             return turn.speaker
-        gap = max(0.0, turn.start - end, start - turn.end)
+        gap = _gap(start, end, turn.start, turn.end)
         if gap < best_gap:
             best, best_gap = turn.speaker, gap
-    return best
+    return best if best_gap <= MAX_SPEAKER_ATTACH_GAP else None
 
 
 def _speaker_for_span(start: float, end: float, turns: Sequence[DiarTurn]) -> str | None:
@@ -420,6 +683,25 @@ def _speaker_for_span(start: float, end: float, turns: Sequence[DiarTurn]) -> st
     if not scores:
         return _nearest_speaker(start, end, turns)
     return max(scores.items(), key=lambda kv: kv[1])[0]
+
+
+def _fill_missing_labels(labels: list[str | None]) -> list[str | None]:
+    """用前后邻近的标签补齐「离所有说话人时间片都太远」的词，避免段内出现 UNKNOWN 碎片。"""
+    filled = list(labels)
+    last: str | None = None
+    for i, label in enumerate(filled):
+        if label is None:
+            filled[i] = last
+        else:
+            last = label
+
+    nxt: str | None = None
+    for i in range(len(filled) - 1, -1, -1):
+        if filled[i] is None:
+            filled[i] = nxt
+        else:
+            nxt = filled[i]
+    return filled
 
 
 def _split_segment_by_words(seg: dict, turns: Sequence[DiarTurn]) -> list[dict] | None:
@@ -435,7 +717,10 @@ def _split_segment_by_words(seg: dict, turns: Sequence[DiarTurn]) -> list[dict] 
     labels: list[str | None] = [
         _speaker_for_span(float(w["start"]), float(w["end"]), turns) for w in words
     ]
-    if len({label for label in labels if label}) <= 1:
+    if not any(labels):
+        return None  # 整段都离所有说话人时间片太远，交给 segment 级标 UNKNOWN
+    labels = _fill_missing_labels(labels)
+    if len({label for label in labels}) <= 1:
         return None  # 全段同一人，交给 segment 级处理即可
 
     # 孤词平滑
@@ -628,14 +913,18 @@ def transcribe_task(
     do_diarize: bool = True,
     full_wav: str | Path | None = None,
     progress: Callable[[str, float, str], None] | None = None,
+    min_speakers: int | None = None,
+    max_speakers: int | None = None,
 ) -> dict:
     """切片列表 -> 带全局时间戳与说话人的 segment 列表。
 
-    :param chunks:     audio.analyze() 的返回值
-    :param language:   覆盖 ASR_LANGUAGE，None/'auto' 表示自动判定
-    :param do_diarize: 是否做说话人分离（失败会自动降级，不中断转录）
-    :param full_wav:   用于全局说话人分离的整段 wav，默认取 chunks[0].source
-    :param progress:   进度回调 (stage, fraction 0~1, detail)，用于 /status 实时反馈
+    :param chunks:      audio.analyze() 的返回值
+    :param language:    覆盖 ASR_LANGUAGE，None/'auto' 表示自动判定
+    :param do_diarize:  是否做说话人分离（失败会自动降级，不中断转录）
+    :param full_wav:    用于全局说话人分离的整段 wav，默认取 chunks[0].source
+    :param progress:    进度回调 (stage, fraction 0~1, detail)，用于 /status 实时反馈
+    :param min_speakers: 已知人数时传入，显著提升分离准确率（覆盖 DIAR_MIN/MAX_SPEAKERS）
+    :param max_speakers: 同上
     :return: {"language", "segments": [{start,end,speaker,text}], "speakers", ...}
     """
     if not chunks:
@@ -663,7 +952,10 @@ def transcribe_task(
     fixed_lang: str | None = lang
     started = time.time()
 
-    global _DIAR_UNAVAILABLE
+    global _DIAR_UNAVAILABLE, _DIAR_LAST_ERROR
+
+    if do_diarize:
+        _DIAR_LAST_ERROR = ""  # 只保留本任务的失败原因
 
     try:
         model = load_asr_model()
@@ -679,13 +971,32 @@ def transcribe_task(
             try:
                 report("diarizing", 0.0, "加载说话人分离模型")
                 diar_pipeline = build_diarization_pipeline()
-                turns = diarize(diar_pipeline, source_wav)
+                turns = diarize(
+                    diar_pipeline, source_wav,
+                    min_speakers=min_speakers, max_speakers=max_speakers,
+                )
+                turns = _merge_short_speakers(turns, total_duration)
                 report("diarizing", 1.0, f"识别到 {len({t.speaker for t in turns})} 位说话人")
             except Exception as exc:
-                _DIAR_UNAVAILABLE = str(exc)[:500]
-                logger.error("说话人分离失败，本次结果将不含说话人标签: %s", exc)
+                _DIAR_LAST_ERROR = str(exc)[:500]
+                permanent = _is_permanent_diar_error(_DIAR_LAST_ERROR)
+                if DIAR_CACHE_FAILURE and permanent:
+                    _DIAR_UNAVAILABLE = _DIAR_LAST_ERROR
+                    logger.error("说话人分离不可用（永久性错误，本进程内不再重试）: %s", exc)
+                else:
+                    logger.error("说话人分离失败（临时错误，下个任务会重试）: %s", exc)
                 report("diarizing", 1.0, "说话人分离失败，已降级为无标签转录")
                 turns = []
+            finally:
+                # pyannote 与 ASR 模型同时常驻会多占约 2GB 显存，分离完立刻释放
+                if diar_pipeline is not None:
+                    try:
+                        diar_pipeline.to(torch.device("cpu"))
+                    except Exception:
+                        logger.debug("pyannote 迁回 CPU 失败", exc_info=True)
+                    del diar_pipeline
+                    diar_pipeline = None
+                    free_cuda_memory()
 
         total_chunks = len(chunks)
         for chunk in chunks:
@@ -694,24 +1005,30 @@ def transcribe_task(
             t0 = time.time()
             result = _transcribe_chunk(model, chunk.path, BATCH_SIZE, fixed_lang)
 
-            chunk_language = result.get("language") or fixed_lang or "en"
+            chunk_language = result.get("language") or fixed_lang or "unknown"
             detected_languages.append(chunk_language)
-            segments = [dict(s) for s in (result.get("segments") or [])]
+            segments = _filter_hallucinations([dict(s) for s in (result.get("segments") or [])])
 
-            # 前 N 个「有语音」的切片投票决定全局语言，之后固定传参：
-            # 逐片 auto 会让同一文件的语言来回跳（前 20 分钟 en、后面 ko），而且每片多花一次检测。
+            # 只有「明显单语」时才锁定全局语言；多语内容/平票继续逐片检测。
+            # 强行锁成单一语言会把英文/韩文段按错误语言解码，错误会被放大到整片。
             if fixed_lang is None and segments:
                 lang_votes[chunk_language] += 1
-                if sum(lang_votes.values()) >= LANG_VOTE_SAMPLES:
-                    fixed_lang = lang_votes.most_common(1)[0][0]
-                    logger.info(
-                        "语言投票确定：%s（票数 %s），后续切片固定使用", fixed_lang, dict(lang_votes)
-                    )
+                total_votes = sum(lang_votes.values())
+                top, count = lang_votes.most_common(1)[0]
+                if total_votes >= LANG_VOTE_SAMPLES:
+                    if count / total_votes >= LANG_VOTE_MIN_SHARE:
+                        fixed_lang = top
+                        logger.info("语言投票锁定：%s（票数 %s）", fixed_lang, dict(lang_votes))
+                    else:
+                        logger.info(
+                            "多语内容（票数 %s），不锁定语言，继续逐片检测", dict(lang_votes)
+                        )
 
-            # 对齐结果只用于「按说话人拆段」：分离失败时 words 根本不会被读取，
-            # 却会触发 1.2GB/语言的 wav2vec2 下载 —— auto 模式下直接跳过。
-            if ALIGN_ENABLED and segments and (turns or not ALIGN_ONLY_WITH_DIARIZATION):
-                segments = _align_segments(segments, chunk.path, chunk_language)
+            # 对齐结果只用于「按说话人拆段」：没有说话人标签时 words 根本不会被读取，
+            # 却要按语言各下载/加载一次 1.2GB wav2vec2，因此一律跳过。
+            align_language = fixed_lang or chunk_language
+            if ALIGN_ENABLED and segments and turns and align_language != "unknown":
+                segments = _align_segments(segments, chunk.path, align_language)
 
             _offset_segments(segments, chunk.start_sec)
 
@@ -740,18 +1057,43 @@ def transcribe_task(
         segments = postprocess_segments(collected, gap_sec=gap_sec)
         mapping = renumber_speakers(segments)
 
+        # 顶层 language 不再随便挑一个：没有明显主导语言时如实写 multilingual
+        if detected_languages:
+            top, count = Counter(detected_languages).most_common(1)[0]
+            share = count / len(detected_languages)
+            language_out = top if share >= LANG_VOTE_MIN_SHARE else "multilingual"
+        else:
+            language_out = lang or "auto"
+
+        speech_sec = round(sum(max(0.0, s["end"] - s["start"]) for s in segments), 3)
+        speech_ratio = round(speech_sec / total_duration, 4) if total_duration else 0.0
+        if speech_ratio < 0.01:
+            logger.warning(
+                "有效语音只占 %.2f%%，疑似纯音乐/无人讲解：%s", speech_ratio * 100, source_wav.name
+            )
+
         result_payload = {
-            "language": Counter(detected_languages).most_common(1)[0][0] if detected_languages else (lang or "auto"),
+            "language": language_out,
+            "chunk_languages": detected_languages,
             "segments": segments,
             "speakers": [mapping[k] for k in sorted(mapping, key=lambda k: int(mapping[k].split()[-1]))],
             "num_segments": len(segments),
             "duration_sec": total_duration,
             "diarized": bool(turns),
+            # 分离为什么没成功：写进产物，UI/总结不必再翻日志
+            "diarization": {
+                "requested": bool(do_diarize),
+                "ok": bool(turns),
+                "input_mode": DIAR_AUDIO_INPUT,
+                "reason": (None if turns else _DIAR_UNAVAILABLE or _DIAR_LAST_ERROR) or None,
+            },
+            "speech_ratio": speech_ratio,
             "elapsed_sec": round(time.time() - started, 1),
         }
         logger.info(
-            "转录完成：%d 段 / %d 位说话人 / 总耗时 %.1fs",
-            result_payload["num_segments"], len(result_payload["speakers"]), result_payload["elapsed_sec"],
+            "转录完成：%d 段 / %d 位说话人 / 语音占比 %.1f%% / 总耗时 %.1fs",
+            result_payload["num_segments"], len(result_payload["speakers"]),
+            speech_ratio * 100, result_payload["elapsed_sec"],
         )
         return result_payload
 
@@ -786,11 +1128,19 @@ def transcribe_file(
     language: str | None = None,
     do_diarize: bool = True,
     cleanup_audio: bool = False,
+    min_speakers: int | None = None,
+    max_speakers: int | None = None,
 ) -> dict:
     """端到端便利函数：媒体文件 -> 转录结果（内部先调 audio.analyze）。"""
     chunks = analyze(media_path, chunk_minutes=chunk_minutes)
     try:
-        return transcribe_task(chunks, language=language, do_diarize=do_diarize)
+        return transcribe_task(
+            chunks,
+            language=language,
+            do_diarize=do_diarize,
+            min_speakers=min_speakers,
+            max_speakers=max_speakers,
+        )
     finally:
         if cleanup_audio:
             cleanup(chunks, remove_source=True)
@@ -807,6 +1157,7 @@ def _main() -> None:
     parser.add_argument("--chunk-minutes", type=float, default=None)
     parser.add_argument("--language", default=None, help="auto / en / ja / ko ...")
     parser.add_argument("--no-diarize", action="store_true", help="跳过说话人分离（无需 HF_TOKEN）")
+    parser.add_argument("--speakers", type=int, default=None, help="已知说话人数（同时设 min/max）")
     parser.add_argument("--out", default=None, help="结果 JSON 输出路径")
     parser.add_argument("--print", type=int, default=10, help="打印前 N 段")
     args = parser.parse_args()
@@ -818,6 +1169,8 @@ def _main() -> None:
         chunk_minutes=args.chunk_minutes,
         language=args.language,
         do_diarize=not args.no_diarize,
+        min_speakers=args.speakers,
+        max_speakers=args.speakers,
     )
     for seg in payload["segments"][: args.print]:
         print(f"[{seg['start']:>8.2f} - {seg['end']:>8.2f}] {seg['speaker']:<10} {seg['text']}")

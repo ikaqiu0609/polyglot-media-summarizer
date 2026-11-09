@@ -22,6 +22,7 @@
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import logging
 import shutil
@@ -35,7 +36,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Callable
 
-from fastapi import BackgroundTasks, FastAPI, File, HTTPException, UploadFile
+from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
@@ -99,6 +100,8 @@ class TaskRecord:
     finished_at: datetime | None = None
     summary_path: Path | None = None
     result: dict[str, Any] | None = None
+    # 上传时由用户给出的已知说话人数（None = 交给 pyannote 自动判断）
+    speaker_count: int | None = None
 
     @property
     def elapsed_sec(self) -> float:
@@ -249,8 +252,35 @@ def _summary_result(
         "speakers": transcribed.get("speakers", []),
         "language": transcribed.get("language"),
         "diarized": bool(summary["meta"].get("diarized")),
+        "speaker_mode": summary["meta"].get("speaker_mode"),
+        "diarization": transcribed.get("diarization"),
         "audio_duration_sec": total_audio,
+        "speech_ratio": transcribed.get("speech_ratio"),
         "tokens": summary["usage"],
+    }
+
+
+def _transcribed_result(
+    task_id: str,
+    transcribed: dict,
+    transcript_path: Path,
+    total_audio: float,
+) -> dict[str, Any]:
+    """转录完成但还没总结时对外暴露的信息（进程重启后重建任务也复用它）。"""
+    return {
+        "transcript_path": str(transcript_path),
+        "num_segments": transcribed.get("num_segments", 0),
+        "speakers": transcribed.get("speakers", []),
+        "language": transcribed.get("language"),
+        "diarized": bool(transcribed.get("diarized")),
+        "diarization": transcribed.get("diarization"),
+        "audio_duration_sec": total_audio,
+        "speech_ratio": transcribed.get("speech_ratio"),
+        "summarize_url": f"/summarize/{task_id}",
+        "hint": (
+            "转录免费且已完成。需要总结时 POST /summarize/{task_id}"
+            "（会调用 DeepSeek 并产生费用）；想自动执行请设 AUTO_SUMMARIZE=true。"
+        ),
     }
 
 
@@ -298,28 +328,18 @@ def _pause_for_summary(
         progress=STAGE_RANGES[TaskStatus.TRANSCRIBING][1],
         detail="转录完成，等待手动触发总结（未调用付费 API）",
         finished_at=datetime.now(timezone.utc),
-        result={
-            "transcript_path": str(transcript_path),
-            "num_segments": transcribed.get("num_segments", 0),
-            "speakers": transcribed.get("speakers", []),
-            "language": transcribed.get("language"),
-            "diarized": bool(transcribed.get("diarized")),
-            "audio_duration_sec": total_audio,
-            "summarize_url": f"/summarize/{task_id}",
-            "hint": (
-                "转录免费且已完成。需要总结时 POST /summarize/{task_id}"
-                "（会调用 DeepSeek 并产生费用）；想自动执行请设 AUTO_SUMMARIZE=true。"
-            ),
-        },
+        result=_transcribed_result(task_id, transcribed, transcript_path, total_audio),
     )
     logger.info("任务 %s 转录完成，等待手动触发总结：%s", task_id, transcript_path)
 
 
-def run_pipeline(task_id: str) -> None:
+def run_pipeline(task_id: str, speaker_count: int | None = None) -> None:
     """后台任务主体（同步阻塞，由 BackgroundTasks 放到线程池执行）。
 
     只负责「抽取 → 转录 → 落盘 JSON」。总结默认**不自动执行**：
     DeepSeek 调用要花钱，由用户通过 POST /summarize/{task_id} 显式决定。
+
+    :param speaker_count: 用户声明的已知说话人数（同时作为 min/max 传给 pyannote）
     """
     record = _get(task_id)
     if record is None:
@@ -357,10 +377,16 @@ def run_pipeline(task_id: str) -> None:
             language=settings.asr_language,
             do_diarize=settings.enable_diarization,
             progress=_progress_bridge(task_id, TaskStatus.TRANSCRIBING),
+            min_speakers=speaker_count,
+            max_speakers=speaker_count,
         )
+        # 落盘时带上来源信息：进程重启后靠它把 outputs 里的产物还原成任务
+        payload = dict(transcribed)
+        payload["source_filename"] = record.filename
+        payload["source_size_bytes"] = record.size_bytes
         transcript_path = settings.transcript_path(task_id)
         transcript_path.write_text(
-            json.dumps(transcribed, ensure_ascii=False, indent=2), encoding="utf-8"
+            json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
         )
         _update(
             task_id,
@@ -471,6 +497,53 @@ def _fail(task_id: str, message: str) -> None:
     )
 
 
+def _restore_tasks_from_outputs() -> int:
+    """进程重启后从 data/outputs 重建任务表。
+
+    转录/总结产物都在磁盘上，但任务表只在内存里 —— 不重建的话，
+    重启后 /summarize/{task_id} 和 /result/{task_id} 会直接 404。
+    """
+    restored = 0
+    for path in sorted(settings.output_dir.glob("*.transcript.json")):
+        task_id = path.name.split(".")[0]
+        if len(task_id) != 32 or _get(task_id) is not None:
+            continue
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            logger.warning("跳过无法解析的转录产物 %s：%s", path.name, exc)
+            continue
+
+        finished = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
+        has_summary = settings.summary_path(task_id).exists()
+        filename = str(payload.get("source_filename") or path.name)
+        uploaded = settings.upload_path(task_id, Path(filename).suffix.lower())
+        record = TaskRecord(
+            task_id=task_id,
+            filename=filename,
+            source_path=uploaded if uploaded.exists() else path,
+            size_bytes=int(payload.get("source_size_bytes") or 0),
+            status=TaskStatus.COMPLETED if has_summary else TaskStatus.TRANSCRIBED,
+            progress=100.0 if has_summary else STAGE_RANGES[TaskStatus.TRANSCRIBING][1],
+            detail="已完成" if has_summary else "转录完成，等待手动触发总结（服务重启后恢复）",
+            created_at=finished,
+            finished_at=finished,
+        )
+        result = _transcribed_result(
+            task_id, payload, path, float(payload.get("duration_sec") or 0.0)
+        )
+        if has_summary:
+            record.summary_path = settings.summary_path(task_id)
+            result["summary_path"] = str(record.summary_path)
+        record.result = result
+        _register(record)
+        restored += 1
+
+    if restored:
+        logger.info("从 %s 恢复 %d 个历史任务", settings.output_dir, restored)
+    return restored
+
+
 # ---------------------------------------------------------------------------
 # 上传
 # ---------------------------------------------------------------------------
@@ -545,6 +618,14 @@ _NOISY_LOGGERS = (
 )
 
 
+def _module_available(name: str) -> bool:
+    """只查包是否存在（不 import），用于 /healthz 的依赖自检。"""
+    try:
+        return importlib.util.find_spec(name) is not None
+    except (ImportError, ValueError):
+        return False
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     logging.basicConfig(
@@ -556,6 +637,7 @@ async def lifespan(_: FastAPI):
 
     settings.ensure_dirs()
     logger.info("启动配置：%s", json.dumps(settings.as_dict(), ensure_ascii=False))
+    _restore_tasks_from_outputs()
     if not shutil.which("ffmpeg"):
         logger.error("环境中找不到 ffmpeg，音频抽取会失败")
     if settings.enable_diarization and not settings.hf_token_present:
@@ -566,6 +648,11 @@ async def lifespan(_: FastAPI):
             "pyannote/segmentation-3.0、pyannote/speaker-diarization-community-1（详见 README）",
             settings.diarization_model,
         )
+        if transcribe.diarization_status()["input_mode"] == "path" and not _module_available("torchcodec"):
+            logger.warning(
+                "DIAR_AUDIO_INPUT=path 但 torchcodec 不可用，分离会失败；"
+                "改回 waveform 或按 README 安装与 torch 版本匹配的 torchcodec"
+            )
     if not settings.deepseek_key_present:
         logger.warning("未检测到 DEEPSEEK_API_KEY，手动总结会失败")
     if not settings.auto_summarize:
@@ -586,7 +673,11 @@ app = FastAPI(
 
 
 @app.post("/upload", response_model=UploadResponse, status_code=202, summary="上传媒体并排队处理")
-async def upload(background_tasks: BackgroundTasks, file: UploadFile = File(...)) -> UploadResponse:
+async def upload(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    speakers: int | None = Form(None, ge=1, le=20, description="已知说话人数，留空自动判断"),
+) -> UploadResponse:
     _purge_expired()
 
     filename = Path(file.filename or "upload").name
@@ -602,11 +693,22 @@ async def upload(background_tasks: BackgroundTasks, file: UploadFile = File(...)
     size = await _save_upload(file, dest, settings.max_upload_bytes)
     await file.close()
 
-    _register(TaskRecord(task_id=task_id, filename=filename, source_path=dest, size_bytes=size))
-    logger.info("接收上传 %s（%.1f MB）-> 任务 %s", filename, size / 1e6, task_id)
+    _register(
+        TaskRecord(
+            task_id=task_id,
+            filename=filename,
+            source_path=dest,
+            size_bytes=size,
+            speaker_count=speakers,
+        )
+    )
+    logger.info(
+        "接收上传 %s（%.1f MB）-> 任务 %s（说话人先验=%s）",
+        filename, size / 1e6, task_id, speakers or "自动",
+    )
 
     # BackgroundTasks 会在响应返回后执行，run_pipeline 是同步函数，自动进线程池
-    background_tasks.add_task(run_pipeline, task_id)
+    background_tasks.add_task(run_pipeline, task_id, speakers)
 
     return UploadResponse(
         task_id=task_id,
@@ -686,7 +788,24 @@ def _ensure_summarizable(task_id: str) -> Path:
     summary="对已转录任务触发总结（会调用付费 API）",
 )
 def trigger_summarize(task_id: str, background_tasks: BackgroundTasks) -> SummarizeResponse:
-    """转录完成后由用户显式触发；只读 transcript.json，不重新转录。"""
+    """转录完成后由用户显式触发；只读 transcript.json，不重新转录。
+
+    幂等：已经在总结中时直接返回 202（而不是 409），避免前端重试把日志刷满。
+    """
+    record = _get(task_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail=f"任务不存在：{task_id}")
+    if record.status == TaskStatus.SUMMARIZING:
+        logger.info("任务 %s 已在总结中，忽略重复触发", task_id)
+        return SummarizeResponse(
+            task_id=task_id,
+            status=TaskStatus.SUMMARIZING,
+            transcript_path=str(settings.transcript_path(task_id)),
+            status_url=f"/status/{task_id}",
+            result_url=f"/result/{task_id}",
+            note="该任务正在总结中，本次请求未重复触发（不会重复计费）",
+        )
+
     transcript = _ensure_summarizable(task_id)
     _update(
         task_id,
@@ -779,6 +898,12 @@ def healthz() -> dict[str, Any]:
         "status": "ok",
         "ffmpeg": bool(shutil.which("ffmpeg")),
         "ffprobe": bool(shutil.which("ffprobe")),
+        "media_io": {
+            # 说话人分离走 waveform 解码，soundfile 可用即可；torchcodec 只有 path 模式才需要
+            "soundfile": _module_available("soundfile"),
+            "torchcodec": _module_available("torchcodec"),
+        },
+        "diarization": transcribe.diarization_status(),
         "config": settings.as_dict(),
         "tasks_in_memory": total,
         "pending_summary": pending_summary,

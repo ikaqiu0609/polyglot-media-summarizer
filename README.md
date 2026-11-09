@@ -154,7 +154,7 @@
 | `kresnik/wav2vec2-large-xlsr-korean` | 韩语内容且 `ASR_ALIGN` 生效 | 约 1.2GB |
 | `pyannote/*` 权重 | 首次说话人分离 | 数十 MB |
 
-> `ASR_ALIGN=auto`（默认）只在说话人分离成功时才加载对齐模型。分离失败时对齐结果不会被使用，跳过它能省下这 1.2GB 下载和几分钟等待。
+> 词级对齐只用于「按说话人拆段」，因此**没有说话人标签时一律跳过**（不论 `ASR_ALIGN` 取值）。分离失败时跳过它能省下每种语言约 1.2GB 的下载。
 
 ---
 
@@ -584,7 +584,7 @@ notepad .env
 | `ASR_MODEL` | `medium` | 8G 显存必须降档，`large-v3` 会 OOM |
 | `ASR_COMPUTE_TYPE` | `int8_float16` | 进一步省显存 |
 | `ASR_BATCH_SIZE` | `4` | 别一上来就 16 |
-| `ASR_ALIGN` | `auto` | 分离失败时跳过词级对齐，省约 1.2GB 下载 |
+| `ASR_ALIGN` | `1` | 分离失败时自动跳过词级对齐，省约 1.2GB 下载 |
 | `CHUNK_MINUTES` | `10` | 单片更短，峰值显存更低 |
 | `DATA_ROOT` | `data` | 相对路径按项目根解析，别写 `C:\...` |
 
@@ -957,14 +957,22 @@ python -m app.services.summarizer ./demo.json --out ./summary.md
 | `ASR_COMPUTE_TYPE` | `float16` | CPU 下自动降级 `int8` |
 | `ASR_BATCH_SIZE` | `16` | OOM 时自动减半重试，最多 2 次 |
 | `VAD_METHOD` | `silero` | 免额外许可；`pyannote` 需接受 `segmentation-3.0` 条款 |
-| `ASR_ALIGN` | `auto` | `auto`=仅分离成功时对齐；`1`=强制；`0`=关闭。分离失败时对齐结果不会被使用，`auto` 可省约 1.2GB 下载 |
-| `ASR_LANG_VOTE_SAMPLES` | `3` | 前 N 个「有语音」切片投票决定全局语言，之后固定传参，避免同一文件语言漂移 |
+| `ASR_ALIGN` | `1` | 词级对齐开关（`0` 关闭）。对齐只用于「按说话人拆段」，没有说话人标签时一律跳过，避免按语言各下载 1.2GB wav2vec2 |
+| `ASR_LANG_VOTE_SAMPLES` | `3` | 前 N 个「有语音」切片参与语言投票 |
+| `ASR_LANG_MIN_SHARE` | `0.7` | 某语言占比达到该阈值才锁定全局语言；多语内容/平票继续逐片检测，顶层 `language` 写 `multilingual` |
 | `DIARIZATION_MODEL` | `pyannote/speaker-diarization-3.1` | 保持 3.1；需 Agree 的模型见 [模型授权](#模型授权必读) |
+| `DIAR_AUDIO_INPUT` | `waveform` | `waveform`=自己解码 16k wav 传入（**不依赖 torchcodec**，推荐）；`path`=把路径交给 pyannote（需 torchcodec 与 torch 版本匹配 + 共享版 FFmpeg） |
 | `ENABLE_DIARIZATION` | `true` | 关掉则只转录不打说话人标签（可省 HF_TOKEN） |
-| `DIAR_MIN_SPEAKERS` / `DIAR_MAX_SPEAKERS` | 空 | 已知人数时设置，显著提升准确率 |
+| `DIAR_MIN_SPEAKERS` / `DIAR_MAX_SPEAKERS` | 空 | 已知人数时设置，显著提升准确率；`/upload` 的 `speakers` 表单字段等价 |
+| `DIAR_MIN_SPEAKER_SEC` / `DIAR_MIN_SPEAKER_SHARE` | `5` / `0.01` | 低于该时长的「幽灵说话人」并入最近的保留说话人（防 BGM 误聚类） |
+| `MAX_SPEAKER_ATTACH_GAP` | `2.0` | segment 与最近说话人时间片超过该间隔就标 `UNKNOWN`（宁缺勿错） |
+| `DIAR_CACHE_FAILURE` | `1` | 只缓存永久性失败（403/token）；临时错误（OOM/网络）下个任务重试。`0`=完全不缓存 |
 | `CHUNK_MINUTES` | `15` | 单文件最长时长，超过即切片 |
+| `CHUNK_SNAP_WINDOW` | `20` | 切点在 ±该秒数内吸附到静音中点，避免从句子中间切开；`0`=严格等分 |
+| `SILENCE_NOISE_DB` / `SILENCE_MIN_SEC` | `-35` / `0.6` | `silencedetect` 的静音阈值 |
 | `MERGE_GAP_SEC` / `MAX_MERGED_SEC` | `0.8` / `60` | 同说话人合并阈值与单段上限 |
 | `MERGE_GAP_SEC_NO_DIAR` | `0.3` | 无说话人标签时的合并窗口；比默认更小，避免把不同人的话揉成一段 |
+| `HALLU_NO_SPEECH_PROB` / `HALLU_AVG_LOGPROB` / `HALLU_COMPRESSION_RATIO` | `0.6` / `-1.0` / `2.4` | Whisper 幻觉过滤阈值（BGM/静音处的复读、"感谢观看"类输出） |
 
 ### 总结
 
@@ -1004,7 +1012,7 @@ python -m app.services.summarizer ./demo.json --out ./summary.md
 - 与云端的主要差距在转录吞吐，不在分离；`medium` 比 `large-v3` 快 2~3 倍，精度下降主要体现在专业术语与韩/日文片段。
 - 显存吃紧时按优先级依次降：`ASR_BATCH_SIZE=2` → `ASR_MODEL=small` → `ENABLE_DIARIZATION=false`（省掉 pyannote 的约 2GB）。
 - 说话人分离是在**整段 wav** 上跑的，与切片数无关；长音频分离阶段的显存占用不会因为 `CHUNK_MINUTES` 变小而下降。
-- 上表的端到端时间**不含首次模型下载**：`ASR_ALIGN=auto` 且分离成功时，首次处理某语言还会下载约 1.2GB 的 wav2vec2 对齐模型（中文/韩语各一份）。分离失败或 `ASR_ALIGN=0` 时不会触发。
+- 上表的端到端时间**不含首次模型下载**：对齐开启且分离成功时，首次处理某语言还会下载约 1.2GB 的 wav2vec2 对齐模型（中文/韩语各一份）。分离失败或 `ASR_ALIGN=0` 时不会触发。
 
 ### 成本
 
@@ -1050,7 +1058,26 @@ RUN python -c "from faster_whisper import WhisperModel; WhisperModel('large-v3',
 <details>
 <summary><b>说话人全是 UNKNOWN</b></summary>
 
-说明分离环节降级了（日志里有 `说话人分离失败`）。检查 `HF_TOKEN`、许可、以及 `ENABLE_DIARIZATION`；`/healthz` 里的 `hf_token_present` 可快速确认。
+说明分离环节降级了（日志里有 `说话人分离失败`）。先看 `GET /healthz`：
+
+- `diarization.last_error` 会给出最近一次失败原因，`diarization.cached_reason` 非空表示本进程已放弃分离（永久性错误才会被缓存）；
+- `media_io.soundfile=false` 说明 waveform 解码不可用；
+- `media_io.torchcodec=false` 只在 `DIAR_AUDIO_INPUT=path` 时才重要。
+
+历史上最常见的是 `torchcodec is not available`——pyannote.audio 4.x 默认用 torchcodec 解码，而它必须与 torch 版本严格匹配、Windows 上还需要共享版 FFmpeg DLL。本项目现在默认走 `DIAR_AUDIO_INPUT=waveform`（自己读 16k wav），不会再触发这个错误。若你手动改成了 `path`，请改回 `waveform`。
+
+其余检查项：`HF_TOKEN`、三个 gated 模型的 Agree、`ENABLE_DIARIZATION`。
+</details>
+
+<details>
+<summary><b>分离结果出现「6 位说话人」/ 有人只说了 2 秒</b></summary>
+
+BGM、音效、多人重叠说话会让 pyannote 3.1 过度聚类。本项目已做两层清洗：
+
+1. 总时长低于 `DIAR_MIN_SPEAKER_SEC`（默认 5s）或占比低于 `DIAR_MIN_SPEAKER_SHARE`（默认 1%）的说话人，会按时间就近并入保留的说话人；
+2. 已知人数时直接声明，比任何后处理都有效：`DIAR_MIN_SPEAKERS=2` + `DIAR_MAX_SPEAKERS=2`，或上传时带 `speakers=2` 表单字段。
+
+仍不理想时，可换 `DIARIZATION_MODEL=pyannote/speaker-diarization-community-1`（同样需要 Agree）。
 </details>
 
 <details>
@@ -1062,7 +1089,11 @@ RUN python -c "from faster_whisper import WhisperModel; WhisperModel('large-v3',
 <details>
 <summary><b>韩语/日语片段被识别成英文</b></summary>
 
-`auto` 模式下语言是**逐片**检测的（不是整段一次），所以长视频里前几片可能被判成 `en`、后面才变成 `ko`。现在默认取前 3 个「有语音」切片投票，投票完成后固定传给所有切片（`ASR_LANG_VOTE_SAMPLES`）。
+`auto` 模式下语言是**逐片**检测的（不是整段一次），所以长视频里前几片可能被判成 `en`、后面才变成 `ko`。
+
+现在的策略是：前 3 个「有语音」切片投票，**只有某个语言占比 ≥ `ASR_LANG_MIN_SHARE`（默认 0.7）才锁定**并固定传给后续切片；多语内容或平票则继续逐片检测，顶层 `language` 写成 `multilingual`，每个切片的判定结果记录在 `transcript.json` 的 `chunk_languages` 里。
+
+这样处理日语开场 + 英文主体 + 韩语片段的混合内容时，不会再被强行按单一语言解码。
 
 如果内容语言已知，最稳妥的做法是直接指定：
 
@@ -1092,13 +1123,13 @@ ASR_LANGUAGE=ko
 <details>
 <summary><b>分离失败时为什么不再下载词级对齐模型了</b></summary>
 
-对齐（wav2vec2）的唯一用途是把一个 segment 按说话人拆开。分离失败时所有段落都是 `UNKNOWN`，对齐结果不会被读取，却会按语言触发约 1.2GB 下载。`ASR_ALIGN=auto`（默认）因此只在分离成功时才对齐；确实需要 word 级时间戳（做字幕）时设 `ASR_ALIGN=1`。
+对齐（wav2vec2）的唯一用途是把一个 segment 按说话人拆开。分离失败时所有段落都是 `UNKNOWN`，对齐结果不会被读取，却会按语言触发约 1.2GB 下载。因此**只要没有说话人标签就跳过对齐**（`ASR_ALIGN` 只控制开关，不再有「强制」语义）。word 级时间戳目前也不会写入 `transcript.json`，需要字幕时可以在这里扩展输出。
 </details>
 
 <details>
 <summary><b>重启后任务全丢了</b></summary>
 
-`/upload` 的任务状态是进程内内存字典，重启即清空（`data/outputs` 里的产物还在）。需要持久化请替换 `app/main.py` 的 `_tasks` 为 Redis，并把 `BackgroundTasks` 换成 Celery/RQ。
+服务启动时会扫描 `data/outputs/*.transcript.json` 重建任务表：有对应 `.md` 的标为 `completed`，没有的标为 `transcribed`，因此重启后 `/summarize/{task_id}`、`/result/{task_id}` 仍然可用。但**运行中的任务**无法恢复，仍需替换 `app/main.py` 的 `_tasks` 为 Redis，并把 `BackgroundTasks` 换成 Celery/RQ。
 </details>
 
 ---
@@ -1115,12 +1146,12 @@ ASR_LANGUAGE=ko
 
 ## 已知限制
 
-1. 任务状态为单进程内存态，不支持多 worker / 多副本。
+1. 任务状态为单进程内存态，不支持多 worker / 多副本（服务启动时会从 `data/outputs/*.transcript.json` 恢复历史任务，但运行中的任务无法迁移）。
 2. 无鉴权与限流，公网暴露前需自行加网关或 Token 校验。
 3. 支持从转录 JSON 重跑总结（`POST /summarize/{task_id}`、`POST /summarize`），但没有「从转录中断点继续」的接口；上传文件默认保留，可重新上传。
-4. 切片不做重叠，边界半句依靠「词级拆段 + 字符级去重」修复，极端情况下仍可能丢掉一个词。
+4. 切片不做重叠，边界半句依靠「切点吸附静音 + 词级拆段 + 字符级去重」修复，极端情况下仍可能丢掉一个词。
 5. 同一段 30s 内两人抢话时，说话人切分会有抖动（已做孤词平滑，但不保证完全准确）。
-6. 说话人分离失败（授权缺失、显存不足等）时会自动降级为无标签转录，此时总结会走「单人口播」prompt，不再产出说话人观察章节。
+6. 说话人分离失败（授权缺失、显存不足等）时会自动降级为无标签转录。总结按三态处理：有标签走多人 prompt；**做了分离但失败**走「多人对话未分离」prompt（不编造 Speaker、不假设单口播）；只有明确没请求分离时才按单人口播处理。
 
 ---
 

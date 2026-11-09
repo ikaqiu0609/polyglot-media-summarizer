@@ -30,6 +30,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Sequence
 
 from app.config import resolve_path
 
@@ -95,6 +96,12 @@ CHUNK_MINUTES = float(os.getenv("CHUNK_MINUTES", "15"))  # 单文件最长时长
 FFMPEG_TIMEOUT = int(os.getenv("FFMPEG_TIMEOUT", "1800"))  # 单次 FFmpeg 调用超时（秒）
 MIN_CHUNK_SEC = 1.0                                     # 小于该时长的尾片直接丢弃
 
+# 切点对齐静音：在目标切点 ±CHUNK_SNAP_WINDOW 秒内找静音中点，避免从句子中间切开。
+# 设为 0 可关闭（退回严格等分切点）。
+CHUNK_SNAP_WINDOW = float(os.getenv("CHUNK_SNAP_WINDOW", "20"))
+SILENCE_NOISE_DB = float(os.getenv("SILENCE_NOISE_DB", "-35"))
+SILENCE_MIN_SEC = float(os.getenv("SILENCE_MIN_SEC", "0.6"))
+
 # 数据目录：DATA_ROOT 支持相对路径（相对项目根）或绝对路径，默认 <项目根>/data
 DATA_ROOT = resolve_path(os.getenv("DATA_ROOT") or "data")
 AUDIO_DIR = DATA_ROOT / "audio"
@@ -154,8 +161,8 @@ def _tail(text: str | bytes | None, limit: int = 800) -> str:
     return text[-limit:]
 
 
-def run_command(cmd: list[str], stage: str, timeout: int | None = FFMPEG_TIMEOUT) -> str:
-    """执行外部命令，统一异常与日志。返回 stdout。"""
+def _run_command(cmd: list[str], stage: str, timeout: int | None = FFMPEG_TIMEOUT) -> tuple[str, str]:
+    """执行外部命令，统一异常与日志，返回 (stdout, stderr)。"""
     logger.debug("[%s] %s", stage, " ".join(cmd))
     started = time.time()
     try:
@@ -179,13 +186,20 @@ def run_command(cmd: list[str], stage: str, timeout: int | None = FFMPEG_TIMEOUT
         ) from exc
 
     stdout = (proc.stdout or b"").decode("utf-8", errors="replace")
-    stderr = _tail(proc.stderr)
+    stderr_raw = (proc.stderr or b"").decode("utf-8", errors="replace")
+    stderr_tail = _tail(stderr_raw)
 
     if proc.returncode != 0:
-        logger.error("[%s] ffmpeg 退出码 %s: %s", stage, proc.returncode, stderr)
-        raise AudioProcessingError(f"{stage} 失败（退出码 {proc.returncode}）：{stderr}")
+        logger.error("[%s] ffmpeg 退出码 %s: %s", stage, proc.returncode, stderr_tail)
+        raise AudioProcessingError(f"{stage} 失败（退出码 {proc.returncode}）：{stderr_tail}")
 
     logger.info("[%s] 完成，耗时 %.1fs", stage, time.time() - started)
+    return stdout, stderr_raw
+
+
+def run_command(cmd: list[str], stage: str, timeout: int | None = FFMPEG_TIMEOUT) -> str:
+    """执行外部命令，统一异常与日志。返回 stdout。"""
+    stdout, _stderr = _run_command(cmd, stage, timeout=timeout)
     return stdout
 
 
@@ -255,6 +269,53 @@ def has_audio_stream(path: str | Path) -> bool:
     return "audio" in out.lower()
 
 
+def probe_silences(
+    path: str | Path,
+    noise_db: float = SILENCE_NOISE_DB,
+    min_silence: float = SILENCE_MIN_SEC,
+) -> list[tuple[float, float]]:
+    """用 ffmpeg silencedetect 探测静音区间 [(start, end), ...]。
+
+    任何失败都退化为空列表（切片回到固定等分），不影响主流程。
+    """
+    stderr = ""
+    try:
+        _stdout, stderr = _run_command(
+            [
+                FFMPEG_BIN, "-hide_banner", "-nostdin",
+                "-i", str(path),
+                "-af", f"silencedetect=noise={noise_db}dB:d={min_silence}",
+                "-f", "null", "-",
+            ],
+            stage="silencedetect",
+            timeout=900,
+        )
+    except AudioProcessingError as exc:
+        logger.warning("静音探测失败，改用固定切点: %s", exc)
+        return []
+
+    silences: list[tuple[float, float]] = []
+    start: float | None = None
+    for line in stderr.splitlines():
+        if "silence_start:" in line:
+            try:
+                start = float(line.split("silence_start:")[1].split()[0])
+            except (IndexError, ValueError):
+                start = None
+        elif "silence_end:" in line and start is not None:
+            try:
+                end = float(line.split("silence_end:")[1].split()[0])
+            except (IndexError, ValueError):
+                start = None
+                continue
+            if end > start:
+                silences.append((round(start, 3), round(end, 3)))
+            start = None
+
+    logger.info("静音探测：%d 段（阈值 %.0fdB / %.2fs）", len(silences), noise_db, min_silence)
+    return silences
+
+
 # ---------------------------------------------------------------------------
 # 抽取
 # ---------------------------------------------------------------------------
@@ -310,10 +371,40 @@ def extract_audio(
 # ---------------------------------------------------------------------------
 # 切片
 # ---------------------------------------------------------------------------
-def plan_chunks(total_duration: float, chunk_seconds: float) -> list[tuple[int, float, float]]:
+def _snap_to_silence(
+    target: float,
+    silences: Sequence[tuple[float, float]],
+    window: float,
+    lower: float,
+    upper: float,
+) -> float:
+    """把切点吸附到 window 内最近的静音中点；找不到就返回原始切点。"""
+    if not silences or window <= 0:
+        return target
+
+    best = target
+    best_gap = window
+    for silence_start, silence_end in silences:
+        midpoint = (silence_start + silence_end) / 2.0
+        if midpoint < lower or midpoint > upper:
+            continue
+        gap = abs(midpoint - target)
+        if gap < best_gap:
+            best, best_gap = midpoint, gap
+    return best
+
+
+def plan_chunks(
+    total_duration: float,
+    chunk_seconds: float,
+    silences: Sequence[tuple[float, float]] | None = None,
+    snap_window: float = CHUNK_SNAP_WINDOW,
+) -> list[tuple[int, float, float]]:
     """纯函数：按总时长规划切片，返回 [(index, start_sec, duration_sec), ...]。
 
     单独拆出来是为了能脱离 ffmpeg 做单元测试。
+    :param silences:    由 probe_silences() 得到的静音区间；给定时切点会吸附到静音中点
+    :param snap_window: 吸附半径（秒），0 表示严格等分
     """
     if total_duration <= 0:
         return []
@@ -321,10 +412,24 @@ def plan_chunks(total_duration: float, chunk_seconds: float) -> list[tuple[int, 
         raise ValueError("chunk_seconds 必须大于 0")
 
     count = math.ceil(total_duration / chunk_seconds - 1e-9)
+    boundaries: list[float] = [0.0]
+    for i in range(1, count):
+        target = round(i * chunk_seconds, 3)
+        snapped = _snap_to_silence(
+            target,
+            silences or (),
+            snap_window,
+            lower=boundaries[-1] + MIN_CHUNK_SEC,
+            upper=total_duration - MIN_CHUNK_SEC,
+        )
+        # 保证单调递增，避免吸附后与前一片重叠
+        boundaries.append(round(max(snapped, boundaries[-1] + MIN_CHUNK_SEC), 3))
+    boundaries.append(round(total_duration, 3))
+
     plans: list[tuple[int, float, float]] = []
     for i in range(count):
-        start = round(i * chunk_seconds, 3)
-        duration = round(min(chunk_seconds, total_duration - start), 3)
+        start = boundaries[i]
+        duration = round(boundaries[i + 1] - start, 3)
         if duration < MIN_CHUNK_SEC:
             logger.warning("尾片仅 %.2fs，已丢弃（index=%d）", duration, i)
             continue
@@ -336,11 +441,13 @@ def split_audio(
     wav_path: str | Path,
     chunk_seconds: float,
     out_dir: str | Path | None = None,
+    total_duration: float | None = None,
 ) -> list[AudioChunk]:
-    """把一个 wav 按固定时长切成多片，返回带全局偏移的 AudioChunk 列表。"""
+    """把一个 wav 按固定时长切成多片（切点尽量落在静音上），返回带全局偏移的 AudioChunk 列表。"""
     wav_path = Path(wav_path)
-    total = probe_duration(wav_path)
-    plans = plan_chunks(total, chunk_seconds)
+    total = float(total_duration) if total_duration else probe_duration(wav_path)
+    silences = probe_silences(wav_path) if CHUNK_SNAP_WINDOW > 0 else []
+    plans = plan_chunks(total, chunk_seconds, silences=silences)
     logger.info("切分 %s: 总长 %.1fs -> %d 片（每片 %.0fs）", wav_path.name, total, len(plans), chunk_seconds)
 
     target_dir = Path(out_dir) if out_dir else wav_path.parent
@@ -422,7 +529,7 @@ def analyze(
             )
         ]
 
-    return split_audio(wav, chunk_seconds=chunk_seconds, out_dir=work_dir)
+    return split_audio(wav, chunk_seconds=chunk_seconds, out_dir=work_dir, total_duration=total)
 
 
 def cleanup(chunks: list[AudioChunk], remove_source: bool = False) -> None:

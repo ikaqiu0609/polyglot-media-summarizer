@@ -219,7 +219,7 @@ class Settings:
             task_retention_hours=_env_float("TASK_RETENTION_HOURS", 24.0),
             log_level=(_env("LOG_LEVEL", "INFO") or "INFO").upper(),
             asr_model=_env("ASR_MODEL", "large-v3") or "large-v3",
-            asr_align=(_env("ASR_ALIGN", "auto") or "auto").strip().lower(),
+            asr_align=(_env("ASR_ALIGN", "1") or "1").strip().lower(),
             asr_batch_size=_env_int("ASR_BATCH_SIZE", 16),
             vad_method=(_env("VAD_METHOD", "silero") or "silero").strip().lower(),
             diarization_model=_env("DIARIZATION_MODEL", "pyannote/speaker-diarization-3.1")
