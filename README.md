@@ -35,7 +35,7 @@
 | 能力 | 实现 | 说明 |
 |---|---|---|
 | 音频抽取 | FFmpeg | 任意容器 → 16kHz / 单声道 / PCM16 WAV，`-c:a copy` 切片不重编码 |
-| 语音识别 | `murmurai-core`（WhisperX fork）+ `faster-whisper` | 默认 `large-v3`；8GB 显卡可用 `large-v3-turbo` 或 `medium` |
+| 语音识别 | `murmurai-core`（WhisperX fork）+ `faster-whisper` | 支持 `large-v3` / `large-v3-turbo` / `medium`；8GB 显卡推荐 `large-v3-turbo` |
 | 说话人分离 | `pyannote.audio` + `pyannote/speaker-diarization-3.1` | 整段只跑一次，跨切片说话人标签一致 |
 | 长音频处理 | FFmpeg 按时长切片 + Silero VAD | 超过 15 分钟自动切分，规避显存溢出 |
 | 边界拼接 | 切点吸附静音 + 词级拆段 + 字符级去重 | 切片切点造成的半句/重复词自动修复 |
@@ -389,8 +389,8 @@ notepad .env
 | `HF_TOKEN` | `hf_...` | 必填；需为 [3 个 gated 模型](#0-三个必须-agree-的-gated-模型) 点过 Agree 的账号 |
 | `DEEPSEEK_API_KEY` | `sk-...` | 只有生成总结时才会用到 |
 | `AUTO_SUMMARIZE` | `false` | 保持 false：转录完先停下，确认后再决定是否总结 |
-| `ASR_MODEL` | `medium`（模板默认） | 8GB 显存可直接用；想提升多语精度改 `large-v3-turbo`，显存与耗时接近 |
-| `ASR_COMPUTE_TYPE` | `int8_float16` | 用 `large-v3-turbo` 时建议改 `float16` |
+| `ASR_MODEL` | `large-v3-turbo` | 8GB 显存推荐；显存更紧可改 `medium`，追求精度可改 `large-v3` |
+| `ASR_COMPUTE_TYPE` | `float16` | 8GB 显存紧张时改 `int8_float16` |
 | `ASR_BATCH_SIZE` | `4` | 8GB 显存建议 4；OOM 时服务会自动减半重试 |
 | `ASR_ALIGN` | `1` | 分离失败时自动跳过词级对齐 |
 | `CHUNK_MINUTES` | `10` | 单片更短，峰值显存更低 |
