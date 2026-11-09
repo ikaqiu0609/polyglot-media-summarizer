@@ -2,11 +2,9 @@
 # Python 3.10 ~ 3.13 only. 3.14 is NOT supported by murmurai-core (requires <3.14).
 #
 # torch / torchaudio are intentionally NOT listed here:
-#   - Docker / cnb.cool : provided by the base image
-#                         pytorch/pytorch:2.9.0-cuda12.8-cudnn9-runtime
-#   - Windows / macOS   : install the CUDA build manually and BEFORE this file,
-#                         otherwise pip resolves the latest (CPU-only) build first
-#                         and then downgrades it, breaking torchvision/torchcodec:
+#   - Install the CUDA build manually and BEFORE this file, otherwise pip resolves
+#     the latest (CPU-only) build first and then downgrades it, breaking
+#     torchvision/torchcodec:
 #       pip install torch==2.9.0 torchaudio==2.9.0 --index-url https://download.pytorch.org/whl/cu128
 #   - If pip warns "torchvision ... requires torch>=x.y": this project never imports
 #     torchvision, so just run:  pip uninstall -y torchvision
@@ -39,6 +37,5 @@ python-multipart>=0.0.9
 pydantic>=2.9.0
 pydantic-settings>=2.6.0
 
-# Loads .env from the project root (app/config.py). Optional in the cloud,
-# where the platform injects real environment variables.
+# Loads .env from the project root (app/config.py).
 python-dotenv>=1.0.1

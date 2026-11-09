@@ -6,8 +6,8 @@
     main.py 一律显式传入 `settings` 里的值，因此运行时以本文件为准。
 
 环境变量来源（后者不覆盖前者）：
-    1. 系统环境变量 —— 云端（cnb.cool）由平台直接注入
-    2. 项目根目录的 `.env` —— 本地 Windows / macOS / Linux 开发用（python-dotenv）
+    1. 系统环境变量
+    2. 项目根目录的 `.env` —— 本地开发用（python-dotenv）
 
 跨平台约定：
     - 路径全部用 pathlib.Path，代码里不出现写死的 /workspace、/tmp 之类绝对路径
@@ -29,12 +29,12 @@ ENV_FILE = PROJECT_ROOT / ".env"
 
 try:
     from dotenv import load_dotenv
-except ImportError:  # 未安装 python-dotenv 时退化为「只读系统环境变量」，不影响云端运行
+except ImportError:  # 未安装 python-dotenv 时退化为「只读系统环境变量」
     load_dotenv = None  # type: ignore[assignment]
 else:
     # encoding="utf-8"：Windows 默认按 cp936 读文件，.env 里写中文注释会 UnicodeDecodeError
-    # override=False：系统环境变量优先，云端注入的密钥不会被本地 .env 意外覆盖
-    # 文件不存在时 load_dotenv 静默返回 False，容器/云端场景无副作用
+    # override=False：系统环境变量优先，不会被本地 .env 覆盖
+    # 文件不存在时 load_dotenv 静默返回 False
     load_dotenv(dotenv_path=ENV_FILE, encoding="utf-8", override=False)
 
 

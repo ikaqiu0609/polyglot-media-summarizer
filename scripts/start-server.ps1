@@ -7,7 +7,7 @@
     自动完成「进目录 → 找 .venv → 检查端口 → 启动 uvicorn」，
     并在服务就绪后自动打开接口文档页面。
 
-    首次使用如果还没建虚拟环境，加 -Setup 让它顺手装好
+    首次使用如果还没建虚拟环境，加 -Setup 自动准备
     （会下载 torch 等数 GB 依赖，耗时较长）。
 
 .PARAMETER Port
@@ -27,13 +27,13 @@
     不自动打开浏览器。
 
 .EXAMPLE
-    .\scripts\start-local.ps1
+    .\scripts\start-server.ps1
 
 .EXAMPLE
-    .\scripts\start-local.ps1 -Port 8001 -Reload
+    .\scripts\start-server.ps1 -Port 8001 -Reload
 
 .EXAMPLE
-    .\scripts\start-local.ps1 -Setup -BindAddress 0.0.0.0
+    .\scripts\start-server.ps1 -Setup -BindAddress 0.0.0.0
 #>
 [CmdletBinding()]
 param(
@@ -84,7 +84,7 @@ if (-not $python) { $python = Join-Path $ProjectRoot ".venv\Scripts\python.exe" 
 if (-not (Test-Path $python)) {
     if (-not $Setup) {
         Write-Host "[FAIL] 未找到虚拟环境（已查找 .venv / venv）" -ForegroundColor Red
-        Write-Host "       请先按 README B5 执行：" -ForegroundColor DarkGray
+        Write-Host "       请先按 README「本地安装」第 6 节执行：" -ForegroundColor DarkGray
         Write-Host "         rem 看装了哪些 Python（要 3.10~3.13）" -ForegroundColor DarkGray
         Write-Host "         py -0p" -ForegroundColor DarkGray
         Write-Host "         rem 把 3.13 换成你实际有的版本" -ForegroundColor DarkGray
@@ -93,7 +93,7 @@ if (-not (Test-Path $python)) {
         Write-Host "         .venv\Scripts\activate.bat" -ForegroundColor DarkGray
         Write-Host "         pip install torch==2.9.0 torchaudio==2.9.0 --index-url https://download.pytorch.org/whl/cu128" -ForegroundColor DarkGray
         Write-Host "         pip install -r requirements.txt" -ForegroundColor DarkGray
-        Write-Host "       或让本脚本自动准备（会下载数 GB）：scripts\start-local.bat -Setup" -ForegroundColor DarkGray
+        Write-Host "       或让本脚本自动准备（会下载数 GB）：scripts\start-server.bat -Setup" -ForegroundColor DarkGray
         exit 1
     }
 
@@ -114,7 +114,7 @@ if (-not (Test-Path $python)) {
 
     $python = Join-Path $venvDir "Scripts\python.exe"
     if (-not (Test-Path $python)) {
-        Write-Host "[FAIL] 虚拟环境创建失败，请先装 Python 3.12/3.13（README B2）" -ForegroundColor Red
+        Write-Host "[FAIL] 虚拟环境创建失败，请先装 Python 3.12/3.13（README「本地安装」第 3 节）" -ForegroundColor Red
         exit 1
     }
     $pyVer = & $python -c "import sys; print('%d.%d' % sys.version_info[:2])"
@@ -135,7 +135,7 @@ if (-not (Test-Path $python)) {
 
 # ---------------------------------------------------------------------------
 # 1.5 把 venv 里的 cuDNN 9 补进「本次会话」的 PATH
-#   为什么需要：README B6 里那条 `set PATH=...` 只对当时那个窗口有效，关机或新开
+#   为什么需要：README 第 7 节里那条 `set PATH=...` 只对当时那个窗口有效，关机或新开
 #   窗口就没了；而 ctranslate2 找不到 cuDNN 9 时**不会报错，只会静默退回 CPU**
 #   （表现为"第一次很快，重启后突然慢十倍"）。
 #   - 目录从虚拟环境路径反推，所以 .venv / venv / env 三种命名都能覆盖
@@ -181,7 +181,7 @@ function Test-PortFree {
 
 if (-not (Test-PortFree -p $Port)) {
     Write-Host "[FAIL] 端口 $Port 已被占用" -ForegroundColor Red
-    Write-Host "       换端口：scripts\start-local.bat -Port 8001" -ForegroundColor DarkGray
+    Write-Host "       换端口：scripts\start-server.bat -Port 8001" -ForegroundColor DarkGray
     Write-Host "       查占用：Get-NetTCPConnection -LocalPort $Port | Select-Object OwningProcess" -ForegroundColor DarkGray
     exit 1
 }

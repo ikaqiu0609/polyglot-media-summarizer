@@ -8,11 +8,12 @@
 
 接口：
     POST /upload              上传媒体文件，立即返回 task_id（后台抽取+转录）
-    POST /summarize/{task_id} 对已转录任务触发总结（会调用 DeepSeek，产生费用）
+    POST /transcribe/{task_id} 用已上传的媒体重新转录
+    POST /summarize/{task_id} 对已转录任务生成总结（会调用 DeepSeek，产生费用）
     POST /summarize           导入现成的 transcript.json 并总结
     GET  /status/{task_id}    查询状态与进度百分比
     GET  /result/{task_id}    下载 Markdown 总结
-    GET  /healthz             配置与依赖自检（不返回任何密钥）
+    GET  /healthz             健康检查（不返回任何密钥）
 
 并发模型：
     BackgroundTasks 跑在线程池里，函数是同步阻塞的（subprocess + GPU 推理）。
@@ -283,10 +284,7 @@ def _transcribed_result(
             c.get("start") for c in (transcribed.get("chunks") or []) if not c.get("segments")
         ],
         "summarize_url": f"/summarize/{task_id}",
-        "hint": (
-            "转录免费且已完成。需要总结时 POST /summarize/{task_id}"
-            "（会调用 DeepSeek 并产生费用）；想自动执行请设 AUTO_SUMMARIZE=true。"
-        ),
+        "hint": "转录已完成。调用 POST /summarize/{task_id} 生成总结。",
     }
 
 
@@ -327,16 +325,16 @@ def _pause_for_summary(
     transcript_path: Path,
     total_audio: float,
 ) -> None:
-    """转录已完成但未调用付费 API：停在 transcribed，等用户显式触发。"""
+    """转录已完成：停在 transcribed，等用户决定是否生成总结。"""
     _update(
         task_id,
         status=TaskStatus.TRANSCRIBED,
         progress=STAGE_RANGES[TaskStatus.TRANSCRIBING][1],
-        detail="转录完成，等待手动触发总结（未调用付费 API）",
+        detail="转录完成，等待生成总结",
         finished_at=datetime.now(timezone.utc),
         result=_transcribed_result(task_id, transcribed, transcript_path, total_audio),
     )
-    logger.info("任务 %s 转录完成，等待手动触发总结：%s", task_id, transcript_path)
+    logger.info("任务 %s 转录完成，等待生成总结：%s", task_id, transcript_path)
 
 
 def run_pipeline(task_id: str, speaker_count: int | None = None) -> None:
@@ -480,29 +478,23 @@ def run_summarize(task_id: str) -> None:
 
 def _fail(task_id: str, message: str) -> None:
     logger.error("任务 %s 失败：%s", task_id, message)
-    # 转录已完成、只在总结阶段失败时，把产物路径与重跑入口回传，不需要重新上传/转录
+    # 转录已完成、只在总结阶段失败：回传产物与总结入口
     result = None
     transcript = settings.transcript_path(task_id)
     if transcript.exists():
         result = {
             "transcript_path": str(transcript),
-            "retry_url": f"/summarize/{task_id}",
-            "hint": (
-                "转录已完成，修复问题后 POST /summarize/{task_id} 可直接重跑总结"
-                "（不会重新转录，也不需要重新上传）。"
-            ),
+            "summarize_url": f"/summarize/{task_id}",
+            "hint": "转录已完成，可调用 POST /summarize/{task_id} 重试。",
         }
     else:
-        # 转录阶段就失败（模型加载、网络、显存）：上传文件还留着，可以直接重跑
+        # 转录阶段失败：上传文件还在，可以重新转录
         record = _get(task_id)
-        # 导入转录 JSON 的任务 source_path 就是 transcript 本身，没有媒体可重跑
+        # 导入转录 JSON 的任务 source_path 就是 transcript 本身，没有媒体文件
         if record is not None and record.source_path.exists() and record.source_path != transcript:
             result = {
-                "retry_url": f"/retry/{task_id}",
-                "hint": (
-                    "原始上传文件仍在。修复环境（网络、模型缓存、显存等）后 "
-                    "POST /retry/{task_id} 可直接重跑，无需重新上传。"
-                ),
+                "transcribe_url": f"/transcribe/{task_id}",
+                "hint": "原始文件仍在，可调用 POST /transcribe/{task_id} 重新转录。",
             }
     _update(
         task_id,
@@ -563,12 +555,7 @@ def _restore_tasks_from_outputs() -> int:
 
 
 def _restore_orphan_uploads(limit: int = 20) -> int:
-    """把 uploads 里「有文件但没有任务记录」的媒体恢复成 failed 任务。
-
-    典型场景：模型加载失败（网络/显存）后重启服务 —— 任务表在内存里丢了，
-    但 82MB 的上传文件还在。恢复后可以直接 `POST /retry/{task_id}`，
-    不必重新上传。
-    """
+    """服务重启后，把未登记到任务表的上传文件恢复成失败任务，便于重新转录。"""
     if not settings.upload_dir.exists():
         return 0
 
@@ -599,19 +586,19 @@ def _restore_orphan_uploads(limit: int = 20) -> int:
             size_bytes=path.stat().st_size,
             status=TaskStatus.FAILED,
             detail="服务重启，任务中断",
-            error="服务重启导致任务中断；可 POST /retry/{task_id} 重跑（无需重新上传）",
+            error="服务重启导致任务中断，可重新转录",
             created_at=uploaded_at,
             finished_at=uploaded_at,
         )
         record.result = {
-            "retry_url": f"/retry/{task_id}",
-            "hint": "原始上传文件仍在，POST /retry/{task_id} 可重跑转录。",
+            "transcribe_url": f"/transcribe/{task_id}",
+            "hint": "原始文件仍在，可调用 POST /transcribe/{task_id} 重新转录。",
         }
         _register(record)
         restored += 1
 
     if restored:
-        logger.info("从 uploads 恢复 %d 个未完成任务（可直接 /retry）", restored)
+        logger.info("从 uploads 恢复 %d 个未完成任务（可重新转录）", restored)
     return restored
 
 
@@ -744,7 +731,7 @@ app = FastAPI(
 )
 
 
-@app.post("/upload", response_model=UploadResponse, status_code=202, summary="上传媒体并排队处理")
+@app.post("/upload", response_model=UploadResponse, status_code=202, summary="上传媒体")
 async def upload(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
@@ -793,16 +780,17 @@ async def upload(
 
 
 @app.post(
-    "/retry/{task_id}",
+    "/transcribe/{task_id}",
     response_model=UploadResponse,
     status_code=202,
-    summary="用已上传的文件重跑转录（无需重新上传）",
+    summary="重新转录已上传的媒体",
+    description="对同一任务的原始上传文件重新执行转录。",
 )
-def retry_task(task_id: str, background_tasks: BackgroundTasks) -> UploadResponse:
-    """模型加载失败 / 网络抖动 / 显存不足后，重跑同一个任务。
+def retranscribe_task(task_id: str, background_tasks: BackgroundTasks) -> UploadResponse:
+    """用已上传的媒体重新转录。
 
-    只适用于「原始上传文件还在」的任务（`/upload` 创建的）。导入转录 JSON 的任务
-    没有媒体文件，只能走 `/summarize`。
+    仅适用于通过 `/upload` 创建、且原始文件仍在的任务；导入转录 JSON 的任务
+    没有媒体文件，只能使用 `/summarize`。
     """
     record = _get(task_id)
     if record is None:
@@ -810,15 +798,15 @@ def retry_task(task_id: str, background_tasks: BackgroundTasks) -> UploadRespons
     if record.status not in {TaskStatus.FAILED, TaskStatus.TRANSCRIBED, TaskStatus.COMPLETED}:
         raise HTTPException(
             status_code=409,
-            detail=f"任务正在处理中（{record.status.value}），请等结束后再重跑",
+            detail=f"任务正在处理中（{record.status.value}），请稍后再试",
         )
     if record.source_path == settings.transcript_path(task_id):
         raise HTTPException(
-            status_code=409, detail="该任务来自导入的转录 JSON，没有原始媒体，无法重跑转录"
+            status_code=409, detail="该任务没有原始媒体文件，无法重新转录"
         )
     if not record.source_path.exists():
         raise HTTPException(
-            status_code=410, detail="原始上传文件已被清理（超过保留期），请重新上传"
+            status_code=410, detail="原始上传文件已被清理，请重新上传"
         )
 
     _update(
@@ -833,7 +821,7 @@ def retry_task(task_id: str, background_tasks: BackgroundTasks) -> UploadRespons
         result=None,
     )
     background_tasks.add_task(run_pipeline, task_id, record.speaker_count)
-    logger.info("任务 %s 收到重跑请求（%s）", task_id, record.filename)
+    logger.info("任务 %s 收到重新转录请求（%s）", task_id, record.filename)
     return UploadResponse(
         task_id=task_id,
         status=TaskStatus.QUEUED,
@@ -860,10 +848,7 @@ def get_result(task_id: str) -> FileResponse:
     if record.status == TaskStatus.TRANSCRIBED:
         raise HTTPException(
             status_code=409,
-            detail=(
-                "转录已完成，但尚未生成总结（避免自动产生 API 费用）。"
-                f"请先 POST /summarize/{task_id} 触发总结"
-            ),
+            detail=f"尚未生成总结，请先调用 POST /summarize/{task_id}",
         )
     if record.status != TaskStatus.COMPLETED:
         raise HTTPException(status_code=409, detail=f"任务尚未完成（当前状态：{record.status.value}）")
@@ -892,7 +877,7 @@ def _ensure_summarizable(task_id: str) -> Path:
         raise HTTPException(status_code=409, detail="该任务没有转录产物，请先上传媒体完成转录")
 
     if record.status == TaskStatus.SUMMARIZING:
-        raise HTTPException(status_code=409, detail="该任务正在总结中，请勿重复触发")
+        raise HTTPException(status_code=409, detail="该任务正在总结中")
     if record.status in _EARLY_STATUSES:
         raise HTTPException(
             status_code=409, detail=f"任务尚未转录完成（当前状态：{record.status.value}）"
@@ -900,7 +885,7 @@ def _ensure_summarizable(task_id: str) -> Path:
     if record.status == TaskStatus.COMPLETED and settings.summary_path(task_id).exists():
         raise HTTPException(
             status_code=409,
-            detail="总结已存在。如需重跑请先删除对应 .md，或改用 POST /summarize 导入 JSON 生成新任务",
+            detail="总结已存在；如需重新生成，请先删除对应的 .md",
         )
     return transcript
 
@@ -909,12 +894,13 @@ def _ensure_summarizable(task_id: str) -> Path:
     "/summarize/{task_id}",
     response_model=SummarizeResponse,
     status_code=202,
-    summary="对已转录任务触发总结（会调用付费 API）",
+    summary="生成总结",
+    description="对已转录的任务调用 DeepSeek 生成中文总结，会产生 API 费用。",
 )
 def trigger_summarize(task_id: str, background_tasks: BackgroundTasks) -> SummarizeResponse:
-    """转录完成后由用户显式触发；只读 transcript.json，不重新转录。
+    """对已转录任务生成总结（只读 transcript.json）。
 
-    幂等：已经在总结中时直接返回 202（而不是 409），避免前端重试把日志刷满。
+    已在总结中时返回 202，不重复触发。
     """
     record = _get(task_id)
     if record is None:
@@ -927,7 +913,7 @@ def trigger_summarize(task_id: str, background_tasks: BackgroundTasks) -> Summar
             transcript_path=str(settings.transcript_path(task_id)),
             status_url=f"/status/{task_id}",
             result_url=f"/result/{task_id}",
-            note="该任务正在总结中，本次请求未重复触发（不会重复计费）",
+            note="该任务正在总结中",
         )
 
     transcript = _ensure_summarizable(task_id)
@@ -948,7 +934,7 @@ def trigger_summarize(task_id: str, background_tasks: BackgroundTasks) -> Summar
         transcript_path=str(transcript),
         status_url=f"/status/{task_id}",
         result_url=f"/result/{task_id}",
-        note="已开始总结，会调用 DeepSeek API 并产生费用",
+        note="已开始生成总结",
     )
 
 
@@ -956,7 +942,7 @@ def trigger_summarize(task_id: str, background_tasks: BackgroundTasks) -> Summar
     "/summarize",
     response_model=SummarizeResponse,
     status_code=202,
-    summary="导入 transcript.json 并生成总结（会调用付费 API）",
+    summary="导入转录文件并生成总结",
 )
 async def summarize_import(
     background_tasks: BackgroundTasks,
@@ -1009,11 +995,11 @@ async def summarize_import(
         transcript_path=str(transcript_path),
         status_url=f"/status/{task_id}",
         result_url=f"/result/{task_id}",
-        note="已导入转录 JSON 并开始总结，会调用 DeepSeek API 并产生费用",
+        note="已导入转录文件，开始生成总结",
     )
 
 
-@app.get("/healthz", summary="自检")
+@app.get("/healthz", summary="健康检查")
 def healthz() -> dict[str, Any]:
     with _tasks_lock:
         total = len(_tasks)

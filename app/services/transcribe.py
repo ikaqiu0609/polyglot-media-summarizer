@@ -1,4 +1,4 @@
-"""转录 + 说话人分离模块（纯本地推理，不调用任何云端 ASR）。
+"""转录 + 说话人分离模块（本地推理，不调用第三方 ASR 服务）。
 
 流程（顺序对显存峰值很关键）：
     1. 对**整段 16k wav** 跑一次 Pyannote 3.1 说话人分离 —— 只在整段上跑，
@@ -104,7 +104,7 @@ DIAR_TRIM_SILENCE = (os.getenv("DIAR_TRIM_SILENCE", "1") or "1").strip().lower()
 DIAR_TRIM_MIN_SEC = float(os.getenv("DIAR_TRIM_MIN_SEC", "1.0"))  # 裁剪后至少保留的语音时长
 DIAR_ENERGY_THRESHOLD = float(os.getenv("DIAR_ENERGY_THRESHOLD", "0.001"))  # ≈ -60dBFS
 
-# 分离结果清洗：总时长过短的「幽灵说话人」（BGM/音效误聚类）并入最近的保留说话人
+# 分离结果清洗：总时长过短的说话人（BGM/音效误聚类）并入最近的保留说话人
 DIAR_MIN_SPEAKER_SEC = float(os.getenv("DIAR_MIN_SPEAKER_SEC", "5"))
 DIAR_MIN_SPEAKER_SHARE = float(os.getenv("DIAR_MIN_SPEAKER_SHARE", "0.01"))
 # 永久性错误（403 / token）才进程级缓存；临时错误（OOM/网络）下一个任务重试
@@ -138,7 +138,7 @@ LANG_VOTE_SAMPLES = max(1, int(os.getenv("ASR_LANG_VOTE_SAMPLES", "3")))
 LANG_VOTE_MIN_SHARE = float(os.getenv("ASR_LANG_MIN_SHARE", "0.8"))
 
 ASR_OPTIONS: dict[str, Any] = {
-    # 长音频 + 无重叠切片场景下，关闭上文条件可显著减少「复读机」幻觉
+    # 长音频 + 无重叠切片场景下，关闭上文条件可显著减少重复输出
     "condition_on_previous_text": False,
     "word_timestamps": True,  # 说话人逐词对齐需要
     "without_timestamps": False,
@@ -192,7 +192,7 @@ def _mm():
     global _murmurai_mod
     if _murmurai_mod is None:
         started = time.time()
-        import murmurai  # noqa: PLC0415  (延迟导入是刻意为之)
+        import murmurai  # noqa: PLC0415  (延迟导入，避免拖慢启动)
 
         _murmurai_mod = murmurai
         logger.info("murmurai 导入完成 %.1fs", time.time() - started)
@@ -342,12 +342,10 @@ def _model_load_hint(name: str, exc: Exception) -> str:
     if _looks_like_network_error(exc):
         return (
             f"ASR 模型加载失败（{name}）: {exc}。"
-            "这是加载模型时的网络错误，可能来自两处：HuggingFace（权重）或 GitHub"
-            "（silero VAD 通过 torch.hub 拉取）。处理顺序："
-            "① POST /retry 再试；② 权重已缓存时设 ASR_OFFLINE=1；"
-            "③ 若是 silero VAD，可改 VAD_METHOD=pyannote，或恢复 "
-            "%USERPROFILE%\\.cache\\torch\\hub\\snakers4_silero-vad_* 缓存；"
-            "④ 检查代理/VPN（GitHub 与 hf.co 可能是不同链路），或设 HF_ENDPOINT=https://hf-mirror.com。"
+            "请按顺序排查：① POST /transcribe/{task_id} 重试；"
+            "② 权重已缓存时设 ASR_OFFLINE=1；"
+            "③ silero VAD 需要访问 GitHub，可改 VAD_METHOD=pyannote；"
+            "④ 检查代理，或设 HF_ENDPOINT=https://hf-mirror.com。"
         )
     return f"ASR 模型加载失败（{name}）: {exc}"
 
@@ -526,8 +524,7 @@ def _load_waveform_stdlib(path: Path, target_sr: int) -> tuple[torch.Tensor, int
 def _speech_span(waveform: torch.Tensor, sr: int) -> tuple[float, float] | None:
     """返回首个/最后一个「有能量」采样点覆盖的时间段（前后各留 1s 余量）。
 
-    用于在分离前裁掉首尾静音：84 分钟素材里可能有 20 分钟静音，
-    对它们做 pyannote 滑窗纯属浪费（实测约占总耗时的 25%）。
+    用于在分离前裁掉首尾静音，避免对静音段做无意义的滑窗推理。
     """
     energy = waveform.abs().amax(dim=0)
     index = torch.nonzero(energy > DIAR_ENERGY_THRESHOLD).flatten()
@@ -651,10 +648,10 @@ def _gap(a_start: float, a_end: float, b_start: float, b_end: float) -> float:
 
 
 def _merge_short_speakers(turns: list[DiarTurn], speech_duration: float) -> list[DiarTurn]:
-    """把总时长过短的「幽灵说话人」并入时间上最近的保留说话人。
+    """把总时长过短的说话人并入时间上最近的保留说话人。
 
     pyannote 3.1 在 BGM / 音效多的素材上容易额外聚出只说了两三秒的说话人，
-    留着会让总结里出现「6 位说话人」这种明显错误的结果。
+    留着会让总结里的说话人数量明显偏多。
 
     :param speech_duration: 有效语音总时长（不是文件总时长）。
         用文件总时长算占比会偏高：84 分钟素材里含 20 分钟静音时，
@@ -701,7 +698,7 @@ def _speaker_stats(
     turns: Sequence[DiarTurn],
     mapping: dict[str, str] | None = None,
 ) -> list[dict]:
-    """每位说话人的总时长与段数，用于判断是否过度聚类（`Speaker 4` 只有 3 分钟时基本是幽灵）。
+    """每位说话人的总时长与段数，用于判断是否过度聚类。
 
     :param mapping: renumber_speakers() 的 SPEAKER_xx -> Speaker N 映射，
         传入后统计结果与 transcript.json 里的 speakers 一致。
@@ -812,7 +809,7 @@ def _filter_hallucinations(segments: list[dict], label: str = "") -> list[dict]:
     """过滤 Whisper 在 BGM / 静音处的典型幻觉。
 
     三类规则（阈值均可用环境变量覆盖）：
-        1. compression_ratio 过高 —— 复读机式输出；
+        1. compression_ratio 过高 —— 重复输出；
         2. no_speech_prob 高且 avg_logprob 低 —— 这段其实没人说话；
         3. 与上一段归一化后完全相同 —— 连续重复字幕。
     少于 6 个有效字符的重复（例如「はい」「OK」）不算幻觉，避免误杀。

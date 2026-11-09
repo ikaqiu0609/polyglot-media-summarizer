@@ -12,7 +12,7 @@
     - 切片用 -ss/-t + -c:a copy，PCM 直接拷贝不重编码，3 小时音频切片几秒完成；
     - 切片起点由 plan_chunks() 纯函数计算，误差只可能是 PCM packet 对齐量级（~64ms）。
 
-跨平台（Linux 容器 / Windows 本地）：
+跨平台（Windows / macOS / Linux）：
     - 可执行文件不写死路径，按「环境变量 → PATH → Windows 常见安装目录」顺序解析；
     - 所有路径都用 pathlib.Path，数据目录默认是「项目根目录/data」（见 app/config.py）；
     - Windows 下通过 CREATE_NO_WINDOW 抑制 FFmpeg 的控制台窗口。

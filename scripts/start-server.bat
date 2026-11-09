@@ -1,7 +1,7 @@
 @echo off
 chcp 65001 >nul
 rem ===========================================================================
-rem  Polyglot Media Summarizer - one-click local launcher (CMD entry point).
+rem  Polyglot Media Summarizer - one-click launcher (CMD entry point).
 rem
 rem  Why this wrapper exists:
 rem    Running a .ps1 directly from cmd.exe pops up the "choose an app to open
@@ -10,14 +10,14 @@ rem    policy. This .bat calls the same script with -ExecutionPolicy Bypass,
 rem    so it works from cmd.exe and by double-click, without changing the
 rem    machine-wide policy.
 rem
-rem  All logic lives in start-local.ps1. Edit that file, not this one.
+rem  All logic lives in start-server.ps1. Edit that file, not this one.
 rem
 rem  Usage (run from anywhere):
-rem      scripts\start-local.bat
-rem      scripts\start-local.bat -Port 8001
-rem      scripts\start-local.bat -Reload -NoBrowser
-rem      scripts\start-local.bat -Setup            (first run: builds .venv)
-rem      scripts\start-local.bat -BindAddress 0.0.0.0
+rem      scripts\start-server.bat
+rem      scripts\start-server.bat -Port 8001
+rem      scripts\start-server.bat -Reload -NoBrowser
+rem      scripts\start-server.bat -Setup            (first run: builds .venv)
+rem      scripts\start-server.bat -BindAddress 0.0.0.0
 rem
 rem  Press Ctrl+C to stop the server.
 rem ===========================================================================
@@ -29,7 +29,7 @@ rem resolve, and this script would fail before it can report anything useful.
 set "PS=powershell"
 if exist "%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" set "PS=%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe"
 
-"%PS%" -NoProfile -ExecutionPolicy Bypass -File "%SCRIPT_DIR%start-local.ps1" %*
+"%PS%" -NoProfile -ExecutionPolicy Bypass -File "%SCRIPT_DIR%start-server.ps1" %*
 set "RC=%ERRORLEVEL%"
 
 rem 1 = the launcher refused to start (no venv / port busy / bad Python).

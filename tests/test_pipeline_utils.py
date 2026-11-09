@@ -328,7 +328,7 @@ def test_looks_like_network_error() -> None:
     assert transcribe._looks_like_cache_miss(Exception("LocalEntryNotFoundError: offline mode is enabled"))
 
     hint = transcribe._model_load_hint("medium", Exception("HTTP Error 504: Gateway Time-out"))
-    assert "ASR_OFFLINE=1" in hint and "网络错误" in hint and "silero" in hint
+    assert "ASR_OFFLINE=1" in hint and "silero" in hint and "/transcribe/" in hint
 
     cache_hint = transcribe._model_load_hint(
         "medium", Exception("LocalEntryNotFoundError: offline mode is enabled")
@@ -375,7 +375,7 @@ def test_load_asr_model_falls_back_to_pyannote_vad() -> None:
 # ---------------------------------------------------------------------------
 # main: 失败任务重跑
 # ---------------------------------------------------------------------------
-def test_retry_task_requeues_failed_task() -> None:
+def test_retranscribe_task_requeues_failed_task() -> None:
     import uuid
 
     from fastapi import BackgroundTasks
@@ -398,7 +398,7 @@ def test_retry_task_requeues_failed_task() -> None:
             )
         )
         try:
-            response = app_main.retry_task(task_id, BackgroundTasks())
+            response = app_main.retranscribe_task(task_id, BackgroundTasks())
             assert response.status == app_main.TaskStatus.QUEUED
 
             record = app_main._get(task_id)
@@ -406,11 +406,11 @@ def test_retry_task_requeues_failed_task() -> None:
             assert record.error is None and record.result is None
 
             try:
-                app_main.retry_task(task_id, BackgroundTasks())
+                app_main.retranscribe_task(task_id, BackgroundTasks())
             except Exception as exc:  # HTTPException
                 assert getattr(exc, "status_code", None) == 409
             else:
-                raise AssertionError("处理中的任务重复重跑应返回 409")
+                raise AssertionError("处理中的任务重复触发应返回 409")
         finally:
             with app_main._tasks_lock:
                 app_main._tasks.pop(task_id, None)
@@ -435,7 +435,7 @@ def test_restore_orphan_uploads() -> None:
             record = app_main._get(task_id)
             assert record is not None
             assert record.status == app_main.TaskStatus.FAILED
-            assert record.result["retry_url"] == f"/retry/{task_id}"
+            assert record.result["transcribe_url"] == f"/transcribe/{task_id}"
             # 再跑一次不应重复注册
             assert app_main._restore_orphan_uploads() == 0
         finally:
@@ -444,7 +444,7 @@ def test_restore_orphan_uploads() -> None:
                 app_main._tasks.pop(task_id, None)
 
 
-def test_retry_task_rejects_missing_upload() -> None:
+def test_retranscribe_task_rejects_missing_upload() -> None:
     import uuid
 
     from fastapi import BackgroundTasks
@@ -463,7 +463,7 @@ def test_retry_task_rejects_missing_upload() -> None:
     )
     try:
         try:
-            app_main.retry_task(task_id, BackgroundTasks())
+            app_main.retranscribe_task(task_id, BackgroundTasks())
         except Exception as exc:  # HTTPException
             assert getattr(exc, "status_code", None) == 410
         else:

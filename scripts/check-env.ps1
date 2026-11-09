@@ -4,7 +4,7 @@
     Polyglot Media Summarizer —— 本地环境自检（Windows）。
 
 .DESCRIPTION
-    逐项检查 README「部署 B Windows 本地」里的关键前提：
+    逐项检查 README「本地安装（Windows）」里的关键前提：
       1. Python 版本（3.10 ~ 3.13）
       2. 虚拟环境 .venv
       3. Python 依赖（fastapi / openai / murmurai ...）
@@ -87,10 +87,10 @@ if ($usingVenv) {
     Ok "使用虚拟环境: $Python"
 } else {
     Warn "未找到 .venv / venv，使用系统 Python: $Python"
-    Hint "建议先执行 B5：py -0p 看版本，再 py -3.13 -m venv .venv 并安装依赖"
+    Hint "建议先执行 README「本地安装」第 6 节：py -0p 看版本，再 py -3.13 -m venv .venv 并安装依赖"
 }
 
-# 与 start-local.ps1 保持一致：先把 venv 里的 cuDNN 9 补进本次会话 PATH，再探测。
+# 与 start-server.ps1 保持一致：先把 venv 里的 cuDNN 9 补进本次会话 PATH，再探测。
 # 否则每次新开窗口自检都会误报「ctranslate2 看不到 GPU」，而实际启动时是好的。
 if ($usingVenv) {
     $venvRoot = Split-Path -Parent (Split-Path -Parent $Python)
@@ -236,7 +236,7 @@ if ($LASTEXITCODE -eq 0) {
 } else {
     Warn "pip 报告依赖冲突："
     foreach ($line in ($pipCheckOut | Select-Object -First 4)) { Hint "$line" }
-    Hint "只涉及 torchvision / torchcodec 时，卸载或重装对应包即可（见 README B11）"
+    Hint "只涉及 torchvision / torchcodec 时，卸载或重装对应包即可（见 README「安装排错」）"
 }
 
 # ---------------------------------------------------------------------------
@@ -263,8 +263,8 @@ if ($null -ne $info.ct2_devices) {
     } else {
         Fail "ctranslate2 看不到 CUDA 设备 —— 缺 cuDNN 9 的 DLL，转录会静默退回 CPU"
         Hint "先装：pip install ""nvidia-cudnn-cu12==9.*"""
-        Hint "装好后不用手工设 PATH：scripts\start-local.bat 启动时会自动注入（本自检也已自动注入）"
-        Hint "详解见 README B6"
+        Hint "装好后不用手工设 PATH：scripts\start-server.bat 启动时会自动注入（本自检也已自动注入）"
+        Hint "详解见 README「本地安装」第 7 节"
     }
 } else {
     Fail "ctranslate2 不可用：$($info.ct2_error)"
@@ -342,7 +342,7 @@ if ($smi) {
 Write-Host ""
 if ($script:fail -eq 0) {
     Write-Host "全部通过（警告 $($script:warn) 项）。" -ForegroundColor Green
-    Write-Host "下一步：scripts\start-local.bat（cmd / 双击；PowerShell 里用 .\scripts\start-local.ps1）" -ForegroundColor Green
+    Write-Host "下一步：scripts\start-server.bat（cmd / 双击；PowerShell 里用 .\scripts\start-server.ps1）" -ForegroundColor Green
     exit 0
 } else {
     Write-Host "失败 $($script:fail) 项、警告 $($script:warn) 项，请按上面的 [FAIL] 提示修复后再启动。" -ForegroundColor Red
