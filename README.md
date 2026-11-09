@@ -849,7 +849,7 @@ againandagainsothosearethemechanicsandeffectssocardtime...
 scripts\setup-separation-env.bat
 ```
 
-脚本会创建 `.venv-sep`（pyannote.audio 3.3.2 + torch cu124），并把解释器路径写进 `.env`：
+脚本会创建 `.venv-sep`（pyannote.audio 3.3.2 + torch 2.6.0+cu124），并把解释器路径写进 `.env`。Python 3.10~3.12 也可以把 torch 换成 2.5.1+cu124；Python 3.13 在 Windows 上只有 2.6.0 可选。
 
 ```ini
 SEPARATION_ENABLED=1
@@ -857,6 +857,12 @@ SEPARATION_PYTHON=D:/projects/polyglot-media-summarizer/.venv-sep/Scripts/python
 ```
 
 还需要用同一个 HF 账号同意两个 gated 模型：`pyannote/separation-ami-1.0`、`pyannote/speech-separation-ami-1.0`。
+
+如果首次分离报 `Weights only load failed ... Unsupported global`，在 `.env` 里加一行（分离子进程会继承）：
+
+```ini
+TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1
+```
 
 **为什么单独一个环境**：分离模型只支持 pyannote.audio 3.3.2，而本项目的 diarization 跑在 4.x，两个大版本不能装在一起。主进程用 subprocess 调脚本，互不干扰。
 
