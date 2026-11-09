@@ -302,6 +302,18 @@ def _looks_like_network_error(exc: Exception) -> bool:
     return any(sign in text for sign in _NETWORK_ERROR_SIGNS)
 
 
+def _looks_like_cache_miss(exc: Exception) -> bool:
+    """HF 离线模式下本地没有完整缓存（此时不该再建议切离线）。"""
+    text = f"{type(exc).__name__}: {exc}".lower()
+    return any(
+        sign in text
+        for sign in (
+            "localentrynotfound", "local_files_only", "offline mode is enabled",
+            "not found in cache", "cannot find the requested files",
+        )
+    )
+
+
 def _enable_offline_mode() -> None:
     """强制 huggingface_hub 只读本地缓存（不再做远端元数据校验）。
 
@@ -320,13 +332,22 @@ def _enable_offline_mode() -> None:
 
 
 def _model_load_hint(name: str, exc: Exception) -> str:
-    """把模型加载错误翻译成可操作的提示（区分网络问题与其它问题）。"""
+    """把模型加载错误翻译成可操作的提示（区分缓存缺失、HF/GitHub 网络问题与其它）。"""
+    if _looks_like_cache_miss(exc):
+        return (
+            f"ASR 模型加载失败（{name}）: {exc}。"
+            "HF 离线模式下本地没有该模型的完整缓存。请临时设 ASR_OFFLINE=0 联网下载一次，"
+            "或确认 ASR_MODEL 名称正确后重启。"
+        )
     if _looks_like_network_error(exc):
         return (
             f"ASR 模型加载失败（{name}）: {exc}。"
-            "这是下载/校验模型时的网络错误（HuggingFace 或代理不可达），不是代码问题。"
-            "模型已缓存时：在 .env 设 ASR_OFFLINE=1（或 HF_HUB_OFFLINE=1）后重启即可离线加载；"
-            "需要重新下载时：检查代理/VPN，或设 HF_ENDPOINT=https://hf-mirror.com。"
+            "这是加载模型时的网络错误，可能来自两处：HuggingFace（权重）或 GitHub"
+            "（silero VAD 通过 torch.hub 拉取）。处理顺序："
+            "① POST /retry 再试；② 权重已缓存时设 ASR_OFFLINE=1；"
+            "③ 若是 silero VAD，可改 VAD_METHOD=pyannote，或恢复 "
+            "%USERPROFILE%\\.cache\\torch\\hub\\snakers4_silero-vad_* 缓存；"
+            "④ 检查代理/VPN（GitHub 与 hf.co 可能是不同链路），或设 HF_ENDPOINT=https://hf-mirror.com。"
         )
     return f"ASR 模型加载失败（{name}）: {exc}"
 
@@ -347,8 +368,7 @@ def load_asr_model(model_name: str | None = None) -> Any:
     kwargs: dict[str, Any] = {
         "device": DEVICE,
         "compute_type": COMPUTE_TYPE,
-        "language": None,          # 语言在 transcribe() 里按片传入
-        "vad_method": VAD_METHOD,  # silero: 轻量、无需许可；pyannote: 需 segmentation 许可
+        "language": None,  # 语言在 transcribe() 里按片传入
         "asr_options": ASR_OPTIONS,
     }
     if MODEL_DIR:
@@ -361,13 +381,17 @@ def load_asr_model(model_name: str | None = None) -> Any:
     if ASR_OFFLINE == "1":
         _enable_offline_mode()
 
+    def _load(vad_method: str) -> Any:
+        attempt = dict(kwargs)
+        attempt["vad_method"] = vad_method  # silero: 轻量；pyannote: 需 segmentation 许可
+        return mm.load_model(name, **_filter_kwargs(mm.load_model, attempt))
+
     logger.info("加载 ASR 模型 %s（device=%s, compute_type=%s, vad=%s）", name, DEVICE, COMPUTE_TYPE, VAD_METHOD)
     started = time.time()
-    call_kwargs = _filter_kwargs(mm.load_model, kwargs)
     try:
-        model = mm.load_model(name, **call_kwargs)
+        model = _load(VAD_METHOD)
     except Exception as exc:
-        # 网络类错误且处于 auto 模式：切离线重试一次（权重已缓存时能直接恢复）
+        # 网络类错误且处于 auto 模式：先切 HF 离线重试一次（权重已缓存时能直接恢复）
         if ASR_OFFLINE != "auto" or not _looks_like_network_error(exc):
             raise TranscriptionError(_model_load_hint(name, exc)) from exc
 
@@ -375,9 +399,23 @@ def load_asr_model(model_name: str | None = None) -> Any:
         _enable_offline_mode()
         logger.warning("本进程后续模型加载将只读本地缓存（重启服务后恢复联网）")
         try:
-            model = mm.load_model(name, **call_kwargs)
-        except Exception as retry_exc:
-            raise TranscriptionError(_model_load_hint(name, retry_exc)) from retry_exc
+            model = _load(VAD_METHOD)
+        except Exception as offline_exc:
+            if VAD_METHOD != "silero" or not _looks_like_network_error(offline_exc):
+                raise TranscriptionError(_model_load_hint(name, offline_exc)) from offline_exc
+
+            # silero VAD 走 torch.hub（GitHub），HF 离线解决不了它：换成 pyannote VAD 再试。
+            # pyannote 的 segmentation 权重随说话人分离一起缓存，通常本地已具备。
+            logger.warning(
+                "离线重试仍失败（%s）；silero VAD 需要从 GitHub 拉取，改用 pyannote VAD 重试",
+                offline_exc,
+            )
+            try:
+                model = _load("pyannote")
+            except Exception as vad_exc:
+                raise TranscriptionError(_model_load_hint(name, vad_exc)) from vad_exc
+            logger.info("已改用 pyannote VAD 完成 ASR 模型加载")
+
     logger.info("ASR 模型加载完成 %.1fs", time.time() - started)
     return model
 

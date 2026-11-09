@@ -974,7 +974,7 @@ python -m app.services.summarizer ./demo.json --out ./summary.md
 | `ASR_LANGUAGE` | `auto` | 英文夹韩日建议 `auto`；强制单语设 `en` |
 | `ASR_COMPUTE_TYPE` | `float16` | CPU 下自动降级 `int8` |
 | `ASR_BATCH_SIZE` | `16` | OOM 时自动减半重试，最多 2 次 |
-| `VAD_METHOD` | `silero` | 免额外许可；`pyannote` 需接受 `segmentation-3.0` 条款 |
+| `VAD_METHOD` | `silero` | 免额外许可，但首次要从 GitHub（torch.hub）下载，网络受限时改 `pyannote`（走 HF，需接受 `segmentation-3.0` 条款）；silero 失败会自动回退 pyannote 重试一次 |
 | `ASR_ALIGN` | `1` | 词级对齐开关（`0` 关闭）。对齐只用于「按说话人拆段」，没有说话人标签时一律跳过，避免按语言各下载 1.2GB wav2vec2 |
 | `ASR_OFFLINE` | `auto` | `auto`=联网失败（HF 504/代理不可达）时自动切 HF 离线模式重试一次；`1`=始终离线（模型已缓存时启动更快）；`0`=始终联网 |
 | `ASR_LANG_VOTE_SAMPLES` | `3` | 前 N 个「有语音」切片参与语言投票 |
@@ -1137,17 +1137,26 @@ ASR_LANGUAGE=ko
 </details>
 
 <details>
-<summary><b>上传后立刻失败：<code>ASR 模型加载失败（medium）: HTTP Error 504: Gateway Time-out</code></b></summary>
+<summary><b>上传后立刻失败：<code>ASR 模型加载失败: HTTP Error 504: Gateway Time-out</code></b></summary>
 
-这不是代码问题，而是加载模型时访问 HuggingFace（或你的代理）超时。即使权重已经在本地缓存，`snapshot_download` 默认仍会做一次远端元数据校验，网络不通就整段失败。
+这不是代码问题，而是加载模型时的网络请求失败。**有两个不同的来源，处理方式不同**：
 
-处理顺序：
+| 报错形态 | 来源 | 说明 |
+|---|---|---|
+| `HTTP Error 504: Gateway Time-out`（urllib 风格） | **GitHub / torch.hub** | 几乎都是 silero VAD：日志里紧跟 `Performing voice activity detection using Silero...`。`ASR_OFFLINE` 对它无效 |
+| `504 Server Error: Gateway Time-out for url: https://huggingface.co/...` | **HuggingFace** | whisper 权重或对齐模型下载/校验失败 |
 
-1. **直接重跑**：`POST /retry/{task_id}`（上传文件还留着，不需要重新上传）；
-2. 确认模型已缓存（`%USERPROFILE%\.cache\huggingface\hub\models--Systran--faster-whisper-medium` 存在）后，在 `.env` 里设 `ASR_OFFLINE=1` 或 `HF_HUB_OFFLINE=1`，重启服务即可完全离线加载；
-3. 需要重新下载时，检查代理/VPN，或设 `HF_ENDPOINT=https://hf-mirror.com`。
+判断方法：看失败前最后一条日志。若是 `Silero` 相关，走第 1 条；否则走第 2 条。
 
-版本 ≥ 当前实现时，`ASR_OFFLINE=auto`（默认）会**自动**在遇到这类网络错误时切到离线模式重试一次，失败信息里也会给出上述提示。
+1. **silero VAD 拉不到 GitHub**（国内常见，GitHub 与 hf.co 链路不同）
+   - 最省事：`.env` 设 `VAD_METHOD=pyannote`（`pyannote/segmentation-3.0` 随说话人分离一起缓存，本地已有），重启后 `POST /retry/{task_id}`；
+   - 或恢复 `%USERPROFILE%\.cache\torch\hub\snakers4_silero-vad_*` 缓存（旧版本是 `_master`，新版本可能请求 `_main`，复制目录改名即可）；
+   - 或给 `HTTP_PROXY` / `HTTPS_PROXY` 配一个能访问 GitHub 的代理；
+   - 当前实现遇到这种情况会**自动**改用 pyannote VAD 再试一次（日志里会写「改用 pyannote VAD 重试」）。
+2. **HuggingFace 不可达**
+   - 先 `POST /retry/{task_id}`（上传文件还留着，不需要重新上传）；
+   - `ASR_OFFLINE=auto`（默认）会自动切 HF 离线模式重试一次；确认缓存存在（如 `%USERPROFILE%\.cache\huggingface\hub\models--Systran--faster-whisper-large-v3`）后可设 `ASR_OFFLINE=1`；
+   - 需要重新下载时，检查代理/VPN，或设 `HF_ENDPOINT=https://hf-mirror.com`。
 </details>
 
 <details>

@@ -324,9 +324,52 @@ def test_looks_like_network_error() -> None:
     assert transcribe._looks_like_network_error(Exception("Max retries exceeded with url"))
     assert transcribe._looks_like_network_error(Exception("[Errno -2] Name or service not known"))
     assert not transcribe._looks_like_network_error(ValueError("bad model name"))
+    assert not transcribe._looks_like_cache_miss(Exception("HTTP Error 504: Gateway Time-out"))
+    assert transcribe._looks_like_cache_miss(Exception("LocalEntryNotFoundError: offline mode is enabled"))
 
     hint = transcribe._model_load_hint("medium", Exception("HTTP Error 504: Gateway Time-out"))
-    assert "ASR_OFFLINE=1" in hint and "网络错误" in hint
+    assert "ASR_OFFLINE=1" in hint and "网络错误" in hint and "silero" in hint
+
+    cache_hint = transcribe._model_load_hint(
+        "medium", Exception("LocalEntryNotFoundError: offline mode is enabled")
+    )
+    assert "ASR_OFFLINE=0" in cache_hint
+
+
+class _FakeASRModule:
+    """模拟 murmurai：silero 失败（GitHub 504），pyannote VAD 成功。"""
+
+    def __init__(self) -> None:
+        self.vads: list[str | None] = []
+
+    def load_model(self, name, **kwargs):
+        self.vads.append(kwargs.get("vad_method"))
+        if kwargs.get("vad_method") == "silero":
+            raise RuntimeError("HTTP Error 504: Gateway Time-out")
+        return "MODEL"
+
+
+def test_load_asr_model_falls_back_to_pyannote_vad() -> None:
+    fake = _FakeASRModule()
+    originals = {
+        "_mm": transcribe._mm,
+        "_enable_offline_mode": transcribe._enable_offline_mode,
+        "ASR_OFFLINE": transcribe.ASR_OFFLINE,
+        "VAD_METHOD": transcribe.VAD_METHOD,
+    }
+    transcribe._mm = lambda: fake
+    transcribe._enable_offline_mode = lambda: None
+    transcribe.ASR_OFFLINE = "auto"
+    transcribe.VAD_METHOD = "silero"
+    try:
+        model = transcribe.load_asr_model("large-v3-turbo")
+    finally:
+        for name, value in originals.items():
+            setattr(transcribe, name, value)
+
+    assert model == "MODEL"
+    # silero 原始尝试 → 离线重试（还是 silero）→ pyannote 兜底
+    assert fake.vads == ["silero", "silero", "pyannote"]
 
 
 # ---------------------------------------------------------------------------
