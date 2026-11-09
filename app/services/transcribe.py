@@ -110,7 +110,8 @@ HALLU_COMPRESSION_RATIO = float(os.getenv("HALLU_COMPRESSION_RATIO", "2.4"))
 # 逐片 auto 检测会让同一文件的语言来回跳（例如前 20 分钟被判成 en、之后是 ko）。
 LANG_VOTE_SAMPLES = max(1, int(os.getenv("ASR_LANG_VOTE_SAMPLES", "3")))
 # 只有当某个语言占比达到该阈值时才锁定；多语内容/平票继续逐片检测。
-LANG_VOTE_MIN_SHARE = float(os.getenv("ASR_LANG_MIN_SHARE", "0.7"))
+# 误锁的代价远大于每片多一次语言检测（约 1~2s），所以默认取 0.8。
+LANG_VOTE_MIN_SHARE = float(os.getenv("ASR_LANG_MIN_SHARE", "0.8"))
 
 ASR_OPTIONS: dict[str, Any] = {
     # 长音频 + 无重叠切片场景下，关闭上文条件可显著减少「复读机」幻觉
@@ -505,6 +506,18 @@ def _merge_short_speakers(turns: list[DiarTurn], total_duration: float) -> list[
     return merged
 
 
+def _speaker_stats(turns: Sequence[DiarTurn]) -> list[dict]:
+    """每位说话人的总时长与段数，用于判断是否过度聚类（`SPEAKER_04` 只有 3 分钟时基本是幽灵）。"""
+    stats: dict[str, dict] = {}
+    for turn in turns:
+        item = stats.setdefault(
+            turn.speaker, {"speaker": turn.speaker, "seconds": 0.0, "turns": 0}
+        )
+        item["seconds"] = round(item["seconds"] + turn.duration, 1)
+        item["turns"] += 1
+    return sorted(stats.values(), key=lambda item: -item["seconds"])
+
+
 # ---------------------------------------------------------------------------
 # 转录
 # ---------------------------------------------------------------------------
@@ -550,9 +563,11 @@ def _align_segments(segments: list[dict], audio_path: Path, language: str) -> li
     if language in _ALIGN_UNAVAILABLE:
         return segments
 
+    # 必须在缓存命中分支之外取模块句柄：否则第二个同语言切片会因 mm 未定义而必然失败
+    mm = _mm()
+
     cached = _ALIGN_CACHE.get(language)
     if cached is None:
-        mm = _mm()
         try:
             logger.info("加载词级对齐模型（language=%s，首次会自动下载约 1.2GB）", language)
             started = time.time()
@@ -573,7 +588,11 @@ def _align_segments(segments: list[dict], audio_path: Path, language: str) -> li
         # whisperx 3.1 返回 list，3.3+ 返回 dict
         return aligned["segments"] if isinstance(aligned, dict) else aligned
     except Exception as exc:
-        logger.warning("词级对齐失败（language=%s），降级为 segment 级时间戳: %s", language, exc)
+        # 同语言的后续切片不再重复尝试，避免日志刷屏与重复耗时
+        _ALIGN_UNAVAILABLE.add(language)
+        logger.warning(
+            "词级对齐失败（language=%s），本任务剩余切片改用 segment 级时间戳: %s", language, exc
+        )
         return segments
 
 
@@ -589,7 +608,7 @@ def _norm_text(text: str) -> str:
     return "".join(ch for ch in text.lower() if ch.isalnum())
 
 
-def _filter_hallucinations(segments: list[dict]) -> list[dict]:
+def _filter_hallucinations(segments: list[dict], label: str = "") -> list[dict]:
     """过滤 Whisper 在 BGM / 静音处的典型幻觉。
 
     三类规则（阈值均可用环境变量覆盖）：
@@ -631,7 +650,12 @@ def _filter_hallucinations(segments: list[dict]) -> list[dict]:
 
     total_dropped = sum(dropped.values())
     if total_dropped:
-        logger.info("幻觉过滤：丢弃 %d 段（%s）", total_dropped, {k: v for k, v in dropped.items() if v})
+        logger.info(
+            "幻觉过滤%s：丢弃 %d 段（%s）",
+            f"[{label}]" if label else "",
+            total_dropped,
+            {k: v for k, v in dropped.items() if v},
+        )
     return kept
 
 
@@ -948,6 +972,7 @@ def transcribe_task(
     turns: list[DiarTurn] = []
     detected_languages: list[str] = []
     collected: list[dict] = []
+    chunk_stats: list[dict] = []
     lang_votes: Counter[str] = Counter()
     fixed_lang: str | None = lang
     started = time.time()
@@ -976,6 +1001,12 @@ def transcribe_task(
                     min_speakers=min_speakers, max_speakers=max_speakers,
                 )
                 turns = _merge_short_speakers(turns, total_duration)
+                diar_sec = round(sum(t.duration for t in turns), 1)
+                if total_duration:
+                    logger.info(
+                        "说话人覆盖：%.0fs / %.0fs（%.1f%%）", diar_sec, total_duration,
+                        diar_sec / total_duration * 100,
+                    )
                 report("diarizing", 1.0, f"识别到 {len({t.speaker for t in turns})} 位说话人")
             except Exception as exc:
                 _DIAR_LAST_ERROR = str(exc)[:500]
@@ -1007,7 +1038,10 @@ def transcribe_task(
 
             chunk_language = result.get("language") or fixed_lang or "unknown"
             detected_languages.append(chunk_language)
-            segments = _filter_hallucinations([dict(s) for s in (result.get("segments") or [])])
+            segments = _filter_hallucinations(
+                [dict(s) for s in (result.get("segments") or [])],
+                label=f"切片 {chunk.index}",
+            )
 
             # 只有「明显单语」时才锁定全局语言；多语内容/平票继续逐片检测。
             # 强行锁成单一语言会把英文/韩文段按错误语言解码，错误会被放大到整片。
@@ -1040,11 +1074,37 @@ def transcribe_task(
             for seg in segments:
                 seg["chunk_index"] = chunk.index
             collected.extend(segments)
+            chunk_stats.append(
+                {
+                    "index": chunk.index,
+                    "start": round(chunk.start_sec, 1),
+                    "duration": round(chunk.duration_sec, 1),
+                    "language": chunk_language,
+                    "segments": len(segments),
+                }
+            )
             logger.info("切片 %d 完成：%d 段，耗时 %.1fs", chunk.index, len(segments), time.time() - t0)
+            if not segments:
+                logger.warning(
+                    "切片 %d（%.0f~%.0fs）没有转录出任何文本：疑似纯音乐/静音，或切片内容异常",
+                    chunk.index, chunk.start_sec, chunk.end_sec,
+                )
             free_cuda_memory()
 
         if not collected:
             raise TranscriptionError("所有切片都没有转录出文本，请检查音频是否含有效语音")
+
+        empty_chunks = [c for c in chunk_stats if c["segments"] == 0]
+        if empty_chunks and total_duration:
+            covered = sum(c["duration"] for c in empty_chunks)
+            logger.warning(
+                "%d/%d 个切片没有文本，共 %.0fs（%.1f%%）：%s",
+                len(empty_chunks), len(chunk_stats), covered, covered / total_duration * 100,
+                [
+                    f"{c['start']:.0f}-{c['start'] + c['duration']:.0f}s"
+                    for c in empty_chunks
+                ],
+            )
 
         report("transcribing", 1.0, "转录与对齐完成，开始后处理")
         diarized = bool(turns)
@@ -1075,8 +1135,10 @@ def transcribe_task(
         result_payload = {
             "language": language_out,
             "chunk_languages": detected_languages,
+            "chunks": chunk_stats,
             "segments": segments,
             "speakers": [mapping[k] for k in sorted(mapping, key=lambda k: int(mapping[k].split()[-1]))],
+            "speaker_stats": _speaker_stats(turns),
             "num_segments": len(segments),
             "duration_sec": total_duration,
             "diarized": bool(turns),

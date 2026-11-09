@@ -250,6 +250,7 @@ def _summary_result(
         "num_segments": transcribed.get("num_segments", 0),
         "num_blocks": summary["meta"].get("num_blocks", 0),
         "speakers": transcribed.get("speakers", []),
+        "speaker_stats": transcribed.get("speaker_stats", []),
         "language": transcribed.get("language"),
         "diarized": bool(summary["meta"].get("diarized")),
         "speaker_mode": summary["meta"].get("speaker_mode"),
@@ -271,11 +272,16 @@ def _transcribed_result(
         "transcript_path": str(transcript_path),
         "num_segments": transcribed.get("num_segments", 0),
         "speakers": transcribed.get("speakers", []),
+        "speaker_stats": transcribed.get("speaker_stats", []),
         "language": transcribed.get("language"),
         "diarized": bool(transcribed.get("diarized")),
         "diarization": transcribed.get("diarization"),
         "audio_duration_sec": total_audio,
         "speech_ratio": transcribed.get("speech_ratio"),
+        # 哪些切片完全没出文本（纯音乐/静音），便于排查「转录结果缺一段」
+        "empty_chunks": [
+            c.get("start") for c in (transcribed.get("chunks") or []) if not c.get("segments")
+        ],
         "summarize_url": f"/summarize/{task_id}",
         "hint": (
             "转录免费且已完成。需要总结时 POST /summarize/{task_id}"

@@ -148,6 +148,98 @@ def test_split_segment_single_speaker_returns_none() -> None:
     assert transcribe._split_segment_by_words(seg, turns) is None
 
 
+def test_speaker_stats_sorted_by_duration() -> None:
+    turns = [_turn(0, 10, "A"), _turn(10, 15, "B"), _turn(15, 25, "A")]
+    stats = transcribe._speaker_stats(turns)
+    assert stats[0] == {"speaker": "A", "seconds": 20.0, "turns": 2}
+    assert stats[1] == {"speaker": "B", "seconds": 5.0, "turns": 1}
+
+
+# ---------------------------------------------------------------------------
+# transcribe: 词级对齐（缓存命中路径）
+# ---------------------------------------------------------------------------
+class _FakeAlignModule:
+    """只实现 align()，用来覆盖缓存命中分支（不需要 torch/HF）。"""
+
+    def __init__(self, fail: bool = False) -> None:
+        self.calls: list[tuple] = []
+        self.fail = fail
+
+    def align(self, segments, model, metadata, path, device=None):
+        self.calls.append((model, metadata, path))
+        if self.fail:
+            raise RuntimeError("align boom")
+        return [dict(seg, aligned=True) for seg in segments]
+
+
+def _with_fake_mm(fake, func):
+    original_mm = transcribe._mm
+    transcribe._mm = lambda: fake
+    transcribe._ALIGN_CACHE.clear()
+    transcribe._ALIGN_UNAVAILABLE.clear()
+    try:
+        return func()
+    finally:
+        transcribe._mm = original_mm
+        transcribe._ALIGN_CACHE.clear()
+        transcribe._ALIGN_UNAVAILABLE.clear()
+
+
+def test_align_segments_uses_cached_model() -> None:
+    fake = _FakeAlignModule()
+
+    def run():
+        transcribe._ALIGN_CACHE["en"] = ("model", "meta")
+        return transcribe._align_segments([{"text": "x"}], Path("a.wav"), "en")
+
+    out = _with_fake_mm(fake, run)
+    assert out[0]["aligned"] is True
+    assert fake.calls and fake.calls[0][:2] == ("model", "meta")
+
+
+class _FakeAlignModuleWithLoader(_FakeAlignModule):
+    """模拟真实流程：第一次加载模型，第二次应命中缓存。"""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.loads = 0
+
+    def load_align_model(self, language_code, device=None):
+        self.loads += 1
+        return ("model", f"meta:{language_code}")
+
+
+def test_align_segments_reuses_model_on_second_chunk() -> None:
+    fake = _FakeAlignModuleWithLoader()
+
+    def run():
+        first = transcribe._align_segments([{"text": "a"}], Path("a.wav"), "en")
+        second = transcribe._align_segments([{"text": "b"}], Path("b.wav"), "en")
+        return first, second
+
+    first, second = _with_fake_mm(fake, run)
+    assert first[0]["aligned"] is True
+    assert second[0]["aligned"] is True  # 修复前这里必然失败（mm 未定义）
+    assert fake.loads == 1
+    assert len(fake.calls) == 2
+
+
+def test_align_failure_skips_language_afterwards() -> None:
+    fake = _FakeAlignModule(fail=True)
+    segments = [{"text": "x"}]
+
+    def run():
+        transcribe._ALIGN_CACHE["en"] = ("model", "meta")
+        first = transcribe._align_segments(segments, Path("a.wav"), "en")
+        second = transcribe._align_segments(segments, Path("a.wav"), "en")
+        return first, second, "en" in transcribe._ALIGN_UNAVAILABLE
+
+    first, second, unavailable = _with_fake_mm(fake, run)
+    assert first == segments and second == segments
+    assert unavailable is True
+    assert len(fake.calls) == 1  # 第二次直接跳过，不再重复调用
+
+
 # ---------------------------------------------------------------------------
 # transcribe: 幻觉过滤 / 后处理
 # ---------------------------------------------------------------------------

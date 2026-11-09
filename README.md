@@ -959,7 +959,7 @@ python -m app.services.summarizer ./demo.json --out ./summary.md
 | `VAD_METHOD` | `silero` | 免额外许可；`pyannote` 需接受 `segmentation-3.0` 条款 |
 | `ASR_ALIGN` | `1` | 词级对齐开关（`0` 关闭）。对齐只用于「按说话人拆段」，没有说话人标签时一律跳过，避免按语言各下载 1.2GB wav2vec2 |
 | `ASR_LANG_VOTE_SAMPLES` | `3` | 前 N 个「有语音」切片参与语言投票 |
-| `ASR_LANG_MIN_SHARE` | `0.7` | 某语言占比达到该阈值才锁定全局语言；多语内容/平票继续逐片检测，顶层 `language` 写 `multilingual` |
+| `ASR_LANG_MIN_SHARE` | `0.8` | 某语言占比达到该阈值才锁定全局语言；多语内容/平票继续逐片检测，顶层 `language` 写 `multilingual` |
 | `DIARIZATION_MODEL` | `pyannote/speaker-diarization-3.1` | 保持 3.1；需 Agree 的模型见 [模型授权](#模型授权必读) |
 | `DIAR_AUDIO_INPUT` | `waveform` | `waveform`=自己解码 16k wav 传入（**不依赖 torchcodec**，推荐）；`path`=把路径交给 pyannote（需 torchcodec 与 torch 版本匹配 + 共享版 FFmpeg） |
 | `ENABLE_DIARIZATION` | `true` | 关掉则只转录不打说话人标签（可省 HF_TOKEN） |
@@ -1091,7 +1091,7 @@ BGM、音效、多人重叠说话会让 pyannote 3.1 过度聚类。本项目已
 
 `auto` 模式下语言是**逐片**检测的（不是整段一次），所以长视频里前几片可能被判成 `en`、后面才变成 `ko`。
 
-现在的策略是：前 3 个「有语音」切片投票，**只有某个语言占比 ≥ `ASR_LANG_MIN_SHARE`（默认 0.7）才锁定**并固定传给后续切片；多语内容或平票则继续逐片检测，顶层 `language` 写成 `multilingual`，每个切片的判定结果记录在 `transcript.json` 的 `chunk_languages` 里。
+现在的策略是：前 3 个「有语音」切片投票，**只有某个语言占比 ≥ `ASR_LANG_MIN_SHARE`（默认 0.8）才锁定**并固定传给后续切片；多语内容或平票则继续逐片检测，顶层 `language` 写成 `multilingual`，每个切片的判定结果记录在 `transcript.json` 的 `chunk_languages` 里。
 
 这样处理日语开场 + 英文主体 + 韩语片段的混合内容时，不会再被强行按单一语言解码。
 
